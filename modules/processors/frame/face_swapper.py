@@ -7,7 +7,7 @@ import platform
 import modules.globals
 import modules.processors.frame.core
 from modules.core import update_status
-from modules.face_analyser import get_one_face, get_many_faces, default_source_face
+from modules.face_analyser import get_one_face, get_many_faces, default_source_face, FaceTracker
 from modules.typing import Face, Frame
 from modules.utilities import (
     conditional_download,
@@ -28,35 +28,43 @@ NAME = "DLC.FACE-SWAPPER"
 PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previous step
 # --- END: Added for Interpolation ---
 
-# --- START: Mac M1-M5 Optimizations ---
+# --- START: Live stream detection-skip optimization ---
+_LIVE_DETECTION_COUNTER: int = 0
+_LIVE_LAST_FACES: list = []
+LIVE_DETECTION_INTERVAL: int = 8  # Detect every N frames
+LIVE_TRACKER = None
+# --- END: Live stream detection-skip optimization ---
+
 IS_APPLE_SILICON = platform.system() == 'Darwin' and platform.machine() == 'arm64'
-FRAME_CACHE = deque(maxlen=3)  # Cache for frame reuse
-FACE_DETECTION_CACHE = {}  # Cache face detections
-LAST_DETECTION_TIME = 0
-DETECTION_INTERVAL = 0.033  # ~30 FPS detection rate for live mode
-FRAME_SKIP_COUNTER = 0
-ADAPTIVE_QUALITY = True
-# --- END: Mac M1-M5 Optimizations ---
 
 abs_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
 )
 
+def get_model_name() -> str:
+    # Use FP32 model on Apple Silicon with CoreML because FP16 has extreme partitioning overhead in CoreML EP
+    if IS_APPLE_SILICON and modules.globals.execution_providers and "CoreMLExecutionProvider" in modules.globals.execution_providers:
+        return "inswapper_128.onnx"
+    return "inswapper_128_fp16.onnx"
+
+
 def pre_check() -> bool:
-    download_directory_path = abs_dir
+    download_directory_path = models_dir
+    model_name = get_model_name()
+    if model_name == "inswapper_128.onnx":
+        url = "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
+    else:
+        url = "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx"
     conditional_download(
         download_directory_path,
-        [
-            "https://huggingface.co/hacksider/deep-live-cam/blob/main/inswapper_128_fp16.onnx"
-        ],
+        [url],
     )
     return True
 
 
 def pre_start() -> bool:
-    # Simplified pre_start, assuming checks happen before calling process functions
-    model_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
+    model_path = os.path.join(models_dir, get_model_name())
     if not os.path.exists(model_path):
         update_status(f"Model not found: {model_path}. Please download it.", NAME)
         return False
@@ -75,9 +83,7 @@ def get_face_swapper() -> Any:
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            model_name = "inswapper_128.onnx"
-            if "CUDAExecutionProvider" in modules.globals.execution_providers:
-                model_name = "inswapper_128_fp16.onnx"
+            model_name = get_model_name()
             model_path = os.path.join(models_dir, model_name)
             update_status(f"Loading face swapper model from: {model_path}", NAME)
             try:
@@ -85,17 +91,15 @@ def get_face_swapper() -> Any:
                 providers_config = []
                 for p in modules.globals.execution_providers:
                     if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
-                        # Enhanced CoreML configuration for M1-M5
+                        # CoreML configuration for Apple Silicon
                         providers_config.append((
                             "CoreMLExecutionProvider",
                             {
                                 "ModelFormat": "MLProgram",
-                                "MLComputeUnits": "ALL",  # Use Neural Engine + GPU + CPU
+                                "MLComputeUnits": "ALL",
                                 "SpecializationStrategy": "FastPrediction",
                                 "AllowLowPrecisionAccumulationOnGPU": 1,
                                 "EnableOnSubgraphs": 1,
-                                "RequireStaticShapes": 0,
-                                "MaximumCacheSize": 1024 * 1024 * 512,  # 512MB cache
                             }
                         ))
                     else:
@@ -245,42 +249,6 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     return final_swapped_frame
 
 
-# --- START: Mac M1-M5 Optimized Face Detection ---
-def get_faces_optimized(frame: Frame, use_cache: bool = True) -> Optional[List[Face]]:
-    """Optimized face detection for live mode on Apple Silicon"""
-    global LAST_DETECTION_TIME, FACE_DETECTION_CACHE
-    
-    if not use_cache or not IS_APPLE_SILICON:
-        # Standard detection
-        if modules.globals.many_faces:
-            return get_many_faces(frame)
-        else:
-            face = get_one_face(frame)
-            return [face] if face else None
-    
-    # Adaptive detection rate for live mode
-    current_time = time.time()
-    time_since_last = current_time - LAST_DETECTION_TIME
-    
-    # Skip detection if too soon (adaptive frame skipping)
-    if time_since_last < DETECTION_INTERVAL and FACE_DETECTION_CACHE:
-        return FACE_DETECTION_CACHE.get('faces')
-    
-    # Perform detection
-    LAST_DETECTION_TIME = current_time
-    if modules.globals.many_faces:
-        faces = get_many_faces(frame)
-    else:
-        face = get_one_face(frame)
-        faces = [face] if face else None
-    
-    # Cache results
-    FACE_DETECTION_CACHE['faces'] = faces
-    FACE_DETECTION_CACHE['timestamp'] = current_time
-    
-    return faces
-# --- END: Mac M1-M5 Optimized Face Detection ---
-
 # --- START: Helper function for interpolation and sharpening ---
 def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.ndarray]) -> Frame:
     """Applies sharpening and interpolation with Apple Silicon optimizations."""
@@ -363,40 +331,48 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
 # --- END: Helper function for interpolation and sharpening ---
 
 
+
 def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
-    """
-    DEPRECATED / SIMPLER VERSION - Processes a single frame using one source face.
-    Consider using process_frame_v2 for more complex scenarios.
-    """
+    """Processes a single frame using one source face."""
     if getattr(modules.globals, "opacity", 1.0) == 0:
-        # If opacity is 0, no swap happens, so no post-processing needed.
-        # Also reset interpolation state if it was active.
         global PREVIOUS_FRAME_RESULT
         PREVIOUS_FRAME_RESULT = None
         return temp_frame
 
-    # Color correction removed from here (better applied before swap if needed)
+    processed_frame = temp_frame
+    swapped_face_bboxes = []
 
-    processed_frame = temp_frame # Start with the input frame
-    swapped_face_bboxes = [] # Keep track of where swaps happened
+    is_file_target = modules.globals.target_path and (is_image(modules.globals.target_path) or is_video(modules.globals.target_path))
 
-    if modules.globals.many_faces:
-        many_faces = get_many_faces(processed_frame)
-        if many_faces:
-            current_swap_target = processed_frame.copy() # Apply swaps sequentially on a copy
-            for target_face in many_faces:
+    if is_file_target:
+        detected_faces = get_many_faces(processed_frame)
+    else:
+        global _LIVE_DETECTION_COUNTER, _LIVE_LAST_FACES, LIVE_TRACKER
+        if LIVE_TRACKER is None:
+            LIVE_TRACKER = FaceTracker()
+        _LIVE_DETECTION_COUNTER += 1
+        if _LIVE_DETECTION_COUNTER >= LIVE_DETECTION_INTERVAL or not _LIVE_LAST_FACES:
+            _LIVE_DETECTION_COUNTER = 0
+            raw_faces = get_many_faces(processed_frame) or []
+            _LIVE_LAST_FACES = LIVE_TRACKER.update(processed_frame, raw_faces)
+        else:
+            _LIVE_LAST_FACES = LIVE_TRACKER.update(processed_frame)
+        detected_faces = _LIVE_LAST_FACES
+
+    if detected_faces:
+        if modules.globals.many_faces:
+            current_swap_target = processed_frame.copy()
+            for target_face in detected_faces:
                 current_swap_target = swap_face(source_face, target_face, current_swap_target)
                 if target_face is not None and hasattr(target_face, "bbox") and target_face.bbox is not None:
                     swapped_face_bboxes.append(target_face.bbox.astype(int))
-            processed_frame = current_swap_target # Assign the final result after all swaps
-    else:
-        target_face = get_one_face(processed_frame)
-        if target_face:
+            processed_frame = current_swap_target
+        else:
+            target_face = detected_faces[0]
             processed_frame = swap_face(source_face, target_face, processed_frame)
             if target_face is not None and hasattr(target_face, "bbox") and target_face.bbox is not None:
                     swapped_face_bboxes.append(target_face.bbox.astype(int))
 
-    # Apply sharpening and interpolation
     final_frame = apply_post_processing(processed_frame, swapped_face_bboxes)
 
     return final_frame
@@ -471,8 +447,17 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                                       source_target_pairs.append((source_face, target_face))
 
     else:
-        # Live stream or webcam processing (analyze faces on the fly)
-        detected_faces = get_many_faces(processed_frame)
+        global _LIVE_DETECTION_COUNTER, _LIVE_LAST_FACES, LIVE_TRACKER
+        if LIVE_TRACKER is None:
+            LIVE_TRACKER = FaceTracker()
+        _LIVE_DETECTION_COUNTER += 1
+        if _LIVE_DETECTION_COUNTER >= LIVE_DETECTION_INTERVAL or not _LIVE_LAST_FACES:
+            _LIVE_DETECTION_COUNTER = 0
+            raw_faces = get_many_faces(processed_frame) or []
+            _LIVE_LAST_FACES = LIVE_TRACKER.update(processed_frame, raw_faces)
+        else:
+            _LIVE_LAST_FACES = LIVE_TRACKER.update(processed_frame)
+        detected_faces = _LIVE_LAST_FACES
         if detected_faces:
             if modules.globals.many_faces:
                  source_face = default_source_face() # Use default source for all detected targets
@@ -607,7 +592,7 @@ def process_frames(
             else:
                 # Simple mode uses the pre-loaded source_face (already checked for validity above)
                 # update_status(f"Using process_frame (simple) for: {os.path.basename(temp_frame_path)}", NAME) # Optional Debug
-                result_frame = process_frame(source_face, temp_frame) # source_face is guaranteed to be valid here
+                result_frame = process_frame(source_face, temp_frame)
 
             # Check if processing actually returned a frame
             if result_frame is None:
@@ -706,19 +691,16 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     """Sets up and calls the frame processing for video."""
     # --- Reset interpolation state before starting video processing ---
-    global PREVIOUS_FRAME_RESULT
+    global PREVIOUS_FRAME_RESULT, _LIVE_DETECTION_COUNTER, _LIVE_LAST_FACES
     PREVIOUS_FRAME_RESULT = None
-    # ---
+    _LIVE_DETECTION_COUNTER = 0
+    _LIVE_LAST_FACES = []
 
     mode_desc = "'map_faces'" if getattr(modules.globals, "map_faces", False) else "'simple'"
-    if getattr(modules.globals, "map_faces", False) and getattr(modules.globals, "many_faces", False):
-        mode_desc += " and 'many_faces'. Using pre-analysis map."
     update_status(f"Processing video with {mode_desc} mode.", NAME)
 
-    # Pass the correct source_path (needed for simple mode in process_frames)
-    # The core processing logic handles calling the right frame function (process_frames)
     modules.processors.frame.core.process_video(
-        source_path, temp_frame_paths, process_frames # Pass the newly modified process_frames
+        source_path, temp_frame_paths, process_frames
     )
 
 # ==========================

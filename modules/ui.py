@@ -21,6 +21,7 @@ from modules.face_analyser import (
     add_blank_map,
     has_valid_map,
     simplify_maps,
+    FaceTracker,
 )
 from modules.capturer import get_video_frame, get_video_frame_total
 from modules.processors.frame.core import get_frame_processors_modules
@@ -977,7 +978,7 @@ def _capture_thread_func(cap, capture_queue, stop_event):
 # How often to run full face detection. On intermediate frames the last
 # detected face positions are reused, which significantly reduces the
 # per-frame cost of the processing thread.
-DETECT_EVERY_N = 2
+DETECT_EVERY_N = 8
 
 
 def _processing_thread_func(capture_queue, processed_queue, stop_event):
@@ -993,6 +994,7 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
     fps_update_interval = 0.5
     frame_count = 0
     fps = 0
+    tracker = FaceTracker()
     proc_frame_index = 0
     cached_target_face = None  # cached single-face result
     cached_many_faces = None   # cached many-faces result
@@ -1014,13 +1016,25 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
             if source_image is None and modules.globals.source_path:
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
 
-            # Update face detection cache on detection frames
+            # Update face detection cache using FaceTracker
             if run_detection or (cached_target_face is None and cached_many_faces is None):
                 if modules.globals.many_faces:
-                    cached_many_faces = get_many_faces(temp_frame)
+                    raw_faces = get_many_faces(temp_frame) or []
+                    cached_many_faces = tracker.update(temp_frame, raw_faces)
                     cached_target_face = None
                 else:
-                    cached_target_face = get_one_face(temp_frame)
+                    raw_face = get_one_face(temp_frame)
+                    raw_faces = [raw_face] if raw_face is not None else []
+                    tracked_faces = tracker.update(temp_frame, raw_faces)
+                    cached_target_face = tracked_faces[0] if tracked_faces else None
+                    cached_many_faces = None
+            else:
+                if modules.globals.many_faces:
+                    cached_many_faces = tracker.update(temp_frame)
+                    cached_target_face = None
+                else:
+                    tracked_faces = tracker.update(temp_frame)
+                    cached_target_face = tracked_faces[0] if tracked_faces else None
                     cached_many_faces = None
 
             for frame_processor in frame_processors:
