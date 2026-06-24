@@ -20,6 +20,60 @@ import os
 from collections import deque
 import time
 
+class HiFiFaceSwapper:
+    def __init__(self, model_path: str, providers: list, provider_options: list = None):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.input_names = [inp.name for inp in self.session.get_inputs()]
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.input_size = (256, 256)
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        from insightface.utils import face_align
+        
+        # 1. Align face to 256x256 using insightface's norm_crop2
+        aimg, M = face_align.norm_crop2(img, target_face.kps, 256)
+        
+        # 2. Convert BGR to RGB and scale to [-1.0, 1.0] range
+        aimg_rgb = cv2.cvtColor(aimg, cv2.COLOR_BGR2RGB)
+        blob = (aimg_rgb.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
+        blob = np.expand_dims(blob, axis=0) # [1, 3, 256, 256]
+        
+        # 3. Get source embedding and reshape
+        latent = source_face.get("_hififace_latent", None)
+        if latent is None:
+            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32)
+            source_face._hififace_latent = latent
+            
+        # Copy to avoid ORT CoreML memory address caching crash
+        latent = latent.copy()
+        
+        # 4. Inference
+        pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
+        pred_img = pred[0]
+        pred_mask = pred[1]
+        
+        # 5. Convert swapped face back to BGR and scale to [0, 255]
+        img_fake = pred_img[0].transpose((1, 2, 0)) # [256, 256, 3] in RGB
+        bgr_fake = np.clip(127.5 * (img_fake + 1.0), 0, 255).astype(np.uint8)
+        bgr_fake = cv2.cvtColor(bgr_fake, cv2.COLOR_RGB2BGR)
+        
+        if not paste_back:
+            return bgr_fake, M
+            
+        # 6. Paste back into original frame using model's output mask
+        IM = cv2.invertAffineTransform(M)
+        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
+        
+        # Process and warp the mask
+        mask_fake = pred_mask[0, 0] # [256, 256]
+        mask_warped = cv2.warpAffine(mask_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
+        mask_warped = np.reshape(mask_warped, [mask_warped.shape[0], mask_warped.shape[1], 1])
+        
+        # Blend images: mask * swapped + (1 - mask) * original
+        fake_merged = mask_warped * bgr_fake_warped.astype(np.float32) + (1.0 - mask_warped) * img.astype(np.float32)
+        return fake_merged.astype(np.uint8)
+
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-SWAPPER"
@@ -43,6 +97,9 @@ models_dir = os.path.join(
 )
 
 def get_model_name() -> str:
+    swapper_model = getattr(modules.globals, "swapper_model", "inswapper")
+    if swapper_model == "hififace":
+        return "hififace_unofficial_256.onnx"
     # Use FP32 model on Apple Silicon with CoreML because FP16 has extreme partitioning overhead in CoreML EP
     if IS_APPLE_SILICON and modules.globals.execution_providers and "CoreMLExecutionProvider" in modules.globals.execution_providers:
         return "inswapper_128.onnx"
@@ -52,7 +109,9 @@ def get_model_name() -> str:
 def pre_check() -> bool:
     download_directory_path = models_dir
     model_name = get_model_name()
-    if model_name == "inswapper_128.onnx":
+    if model_name == "hififace_unofficial_256.onnx":
+        url = "https://huggingface.co/netrunner-exe/Insight-Swap-models-onnx/resolve/main/hififace_unofficial_256.onnx"
+    elif model_name == "inswapper_128.onnx":
         url = "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
     else:
         url = "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx"
@@ -161,13 +220,16 @@ def get_face_swapper() -> Any:
                     else:
                         providers_config.append(p)
                 
-                FACE_SWAPPER = insightface.model_zoo.get_model(
-                    model_path,
-                    providers=providers_config,
-                )
-                import types
-                FACE_SWAPPER.get = types.MethodType(optimized_swapper_get, FACE_SWAPPER)
-                update_status("Face swapper model loaded successfully with CoreML M4 Pro optimizations.", NAME)
+                if model_name == "hififace_unofficial_256.onnx":
+                    FACE_SWAPPER = HiFiFaceSwapper(model_path, providers=providers_config)
+                else:
+                    FACE_SWAPPER = insightface.model_zoo.get_model(
+                        model_path,
+                        providers=providers_config,
+                    )
+                    import types
+                    FACE_SWAPPER.get = types.MethodType(optimized_swapper_get, FACE_SWAPPER)
+                update_status(f"Face swapper model ({model_name}) loaded successfully with CoreML M4 Pro optimizations.", NAME)
             except Exception as e:
                 update_status(f"Error loading face swapper model: {e}", NAME)
                 FACE_SWAPPER = None
