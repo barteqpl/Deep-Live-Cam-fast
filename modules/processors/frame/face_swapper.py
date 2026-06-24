@@ -74,6 +74,79 @@ class HiFiFaceSwapper:
         fake_merged = mask_warped * bgr_fake_warped.astype(np.float32) + (1.0 - mask_warped) * img.astype(np.float32)
         return fake_merged.astype(np.uint8)
 
+class SimSwapSwapper:
+    def __init__(self, model_path: str, providers: list, provider_options: list = None):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.input_names = [inp.name for inp in self.session.get_inputs()]
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.input_size = (256, 256)
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        from insightface.utils import face_align
+        
+        # 1. Align face to 256x256 using insightface's norm_crop2
+        aimg, M = face_align.norm_crop2(img, target_face.kps, 256)
+        
+        # 2. Preprocess target image: BGR -> RGB and ImageNet scaling
+        aimg_rgb = cv2.cvtColor(aimg, cv2.COLOR_BGR2RGB)
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        blob = ((aimg_rgb.astype(np.float32) / 255.0 - mean) / std).transpose(2, 0, 1)
+        blob = np.expand_dims(blob, axis=0) # [1, 3, 256, 256]
+        
+        # 3. Get source embedding and reshape
+        latent = source_face.get("_simswap_latent", None)
+        if latent is None:
+            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32)
+            source_face._simswap_latent = latent
+            
+        # Copy to avoid ORT CoreML memory address caching crash
+        latent = latent.copy()
+        
+        # 4. Inference
+        pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
+        pred_img = pred[0]
+        
+        # 5. Convert swapped face back to BGR and scale from [0.0, 1.0] to [0, 255]
+        img_fake = pred_img[0].transpose((1, 2, 0)) # [256, 256, 3] in RGB
+        bgr_fake = np.clip(img_fake * 255.0, 0, 255).astype(np.uint8)
+        bgr_fake = cv2.cvtColor(bgr_fake, cv2.COLOR_RGB2BGR)
+        
+        if not paste_back:
+            return bgr_fake, M
+            
+        # 6. Paste back into original frame using standard mask pipeline (scaled for 256x256)
+        IM = cv2.invertAffineTransform(M)
+        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
+        
+        # Standard mask pipeline scaled to 256x256 target size
+        img_white = np.full((aimg.shape[0], aimg.shape[1]), 255, dtype=np.float32)
+        img_white = cv2.warpAffine(img_white, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+        img_white[img_white > 20] = 255
+        
+        img_mask = img_white
+        mask_h_inds, mask_w_inds = np.where(img_mask == 255)
+        if len(mask_h_inds) > 0 and len(mask_w_inds) > 0:
+            mask_h = np.max(mask_h_inds) - np.min(mask_h_inds)
+            mask_w = np.max(mask_w_inds) - np.min(mask_w_inds)
+            mask_size = int(np.sqrt(mask_h * mask_w))
+            
+            k = max(mask_size // 10, 10)
+            kernel = np.ones((k, k), np.uint8)
+            img_mask = cv2.erode(img_mask, kernel, iterations=1)
+            
+            k = max(mask_size // 20, 5)
+            kernel_size = (k, k)
+            blur_size = tuple(2*i+1 for i in kernel_size)
+            img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
+        
+        img_mask /= 255.0
+        img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
+        
+        fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)
+        return fake_merged.astype(np.uint8)
+
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-SWAPPER"
@@ -100,6 +173,8 @@ def get_model_name() -> str:
     swapper_model = getattr(modules.globals, "swapper_model", "inswapper")
     if swapper_model == "hififace":
         return "hififace_unofficial_256.onnx"
+    elif swapper_model == "simswap":
+        return "simswap_256.onnx"
     # Use FP32 model on Apple Silicon with CoreML because FP16 has extreme partitioning overhead in CoreML EP
     if IS_APPLE_SILICON and modules.globals.execution_providers and "CoreMLExecutionProvider" in modules.globals.execution_providers:
         return "inswapper_128.onnx"
@@ -111,6 +186,8 @@ def pre_check() -> bool:
     model_name = get_model_name()
     if model_name == "hififace_unofficial_256.onnx":
         url = "https://huggingface.co/netrunner-exe/Insight-Swap-models-onnx/resolve/main/hififace_unofficial_256.onnx"
+    elif model_name == "simswap_256.onnx":
+        url = "https://huggingface.co/netrunner-exe/Insight-Swap-models-onnx/resolve/main/simswap_256.onnx"
     elif model_name == "inswapper_128.onnx":
         url = "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
     else:
@@ -222,6 +299,8 @@ def get_face_swapper() -> Any:
                 
                 if model_name == "hififace_unofficial_256.onnx":
                     FACE_SWAPPER = HiFiFaceSwapper(model_path, providers=providers_config)
+                elif model_name == "simswap_256.onnx":
+                    FACE_SWAPPER = SimSwapSwapper(model_path, providers=providers_config)
                 else:
                     FACE_SWAPPER = insightface.model_zoo.get_model(
                         model_path,
