@@ -1045,12 +1045,10 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                     # Use cached face positions to skip redundant detection
                     swapped_bboxes = []
                     if modules.globals.many_faces and cached_many_faces:
-                        result = temp_frame.copy()
                         for t_face in cached_many_faces:
-                            result = frame_processor.swap_face(source_image, t_face, result)
+                            temp_frame = frame_processor.swap_face(source_image, t_face, temp_frame)
                             if hasattr(t_face, 'bbox') and t_face.bbox is not None:
                                 swapped_bboxes.append(t_face.bbox.astype(int))
-                        temp_frame = result
                     elif cached_target_face is not None:
                         temp_frame = frame_processor.swap_face(source_image, cached_target_face, temp_frame)
                         if hasattr(cached_target_face, 'bbox') and cached_target_face.bbox is not None:

@@ -78,6 +78,60 @@ def pre_start() -> bool:
     return True
 
 
+_MASK_CACHE = {}
+
+def get_precomputed_mask(size: int) -> np.ndarray:
+    if size not in _MASK_CACHE:
+        img_white = np.full((size, size), 255, dtype=np.float32)
+        k = max(size // 10, 10)
+        kernel = np.ones((k, k), np.uint8)
+        img_mask = cv2.erode(img_white, kernel, iterations=1)
+        
+        k = max(size // 20, 5)
+        kernel_size = (k, k)
+        blur_size = tuple(2*i+1 for i in kernel_size)
+        img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
+        img_mask /= 255.0
+        _MASK_CACHE[size] = img_mask
+    return _MASK_CACHE[size]
+
+def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
+    from insightface.utils import face_align
+    
+    aimg, M = face_align.norm_crop2(img, target_face.kps, self.input_size[0])
+    blob = cv2.dnn.blobFromImage(aimg, 1.0 / self.input_std, self.input_size,
+                                  (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
+    
+    latent = source_face.get("_inswapper_latent", None)
+    if latent is None:
+        latent = source_face.normed_embedding.reshape((1,-1))
+        latent = np.dot(latent, self.emap)
+        latent /= np.linalg.norm(latent)
+        latent = latent.astype(np.float32)
+        source_face._inswapper_latent = latent
+        
+    # Crucial: create a copy to avoid ONNX Runtime CoreML EP memory address caching crash
+    latent = latent.copy()
+    
+    pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})[0]
+    img_fake = pred.transpose((0,2,3,1))[0]
+    bgr_fake = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:,:,::-1]
+    
+    if not paste_back:
+        return bgr_fake, M
+        
+    IM = cv2.invertAffineTransform(M)
+    bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+    
+    mask = get_precomputed_mask(self.input_size[0])
+    img_mask_warped = cv2.warpAffine(mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+    
+    img_mask_warped = img_mask_warped[:, :, np.newaxis]
+    
+    fake_merged = img_mask_warped * bgr_fake_warped + (1.0 - img_mask_warped) * img.astype(np.float32)
+    return fake_merged.astype(np.uint8)
+
+
 def get_face_swapper() -> Any:
     global FACE_SWAPPER
 
@@ -109,7 +163,9 @@ def get_face_swapper() -> Any:
                     model_path,
                     providers=providers_config,
                 )
-                update_status("Face swapper model loaded successfully.", NAME)
+                import types
+                FACE_SWAPPER.get = types.MethodType(optimized_swapper_get, FACE_SWAPPER)
+                update_status("Face swapper model loaded successfully with CoreML M4 Pro optimizations.", NAME)
             except Exception as e:
                 update_status(f"Error loading face swapper model: {e}", NAME)
                 FACE_SWAPPER = None
@@ -130,12 +186,18 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if not hasattr(source_face, 'normed_embedding') or source_face.normed_embedding is None:
         return temp_frame
 
-    # Store a copy of the original frame before swapping for opacity blending
-    original_frame = temp_frame.copy()
-
     # Pre-swap Input Check with optimization
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
+
+    poisson_blend = getattr(modules.globals, "poisson_blend", False)
+    opacity = getattr(modules.globals, "opacity", 1.0)
+    opacity = max(0.0, min(1.0, opacity))
+
+    # Lazily copy the original frame only if blending is required
+    original_frame = None
+    if poisson_blend or opacity < 1.0:
+        original_frame = temp_frame.copy()
 
     # Apply the face swap with optimized memory handling
     try:
@@ -151,12 +213,12 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         # Check the output type and range from the model
         if swapped_frame_raw is None:
              # print("Warning: face_swapper.get returned None.") # Debug
-             return original_frame # Return original if swap somehow failed internally
+             return original_frame if original_frame is not None else temp_frame
 
         # Ensure the output is a numpy array
         if not isinstance(swapped_frame_raw, np.ndarray):
             # print(f"Warning: face_swapper.get returned type {type(swapped_frame_raw)}, expected numpy array.") # Debug
-            return original_frame
+            return original_frame if original_frame is not None else temp_frame
 
         # Ensure the output has the correct shape (like the input frame)
         if swapped_frame_raw.shape != temp_frame.shape:
@@ -166,7 +228,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                  swapped_frame_raw = gpu_resize(swapped_frame_raw, (temp_frame.shape[1], temp_frame.shape[0]))
              except Exception as resize_e:
                  # print(f"Error resizing swapped frame: {resize_e}") # Debug
-                 return original_frame
+                 return original_frame if original_frame is not None else temp_frame
 
         # Explicitly clip values to 0-255 and convert to uint8
         # This handles cases where the model might output floats or values outside the valid range
@@ -177,7 +239,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
         print(f"Error during face swap using face_swapper.get: {e}") # More specific error
         # import traceback
         # traceback.print_exc() # Print full traceback for debugging
-        return original_frame # Return original if swap fails
+        return original_frame if original_frame is not None else temp_frame
 
     # --- Post-swap Processing (Masking, Opacity, etc.) ---
     # Now, work with the guaranteed uint8 'swapped_frame'
@@ -234,19 +296,12 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                 except Exception as e:
                     print(f"Poisson blending failed: {e}")
         
-            # Apply opacity blend between the original frame and the swapped frame
-    opacity = getattr(modules.globals, "opacity", 1.0)
-    # Ensure opacity is within valid range [0.0, 1.0]
-    opacity = max(0.0, min(1.0, opacity))
+    # Apply opacity blend if we have the original frame
+    if original_frame is not None:
+        final_swapped_frame = gpu_add_weighted(original_frame, 1 - opacity, swapped_frame, opacity, 0)
+        return final_swapped_frame.astype(np.uint8)
 
-    # Blend the original_frame with the (potentially mouth-masked) swapped_frame
-    # Ensure both frames are uint8 before blending
-    final_swapped_frame = gpu_add_weighted(original_frame.astype(np.uint8), 1 - opacity, swapped_frame.astype(np.uint8), opacity, 0)
-
-    # Ensure final frame is uint8 after blending (addWeighted should preserve it, but belt-and-suspenders)
-    final_swapped_frame = final_swapped_frame.astype(np.uint8)
-
-    return final_swapped_frame
+    return swapped_frame
 
 
 # --- START: Helper function for interpolation and sharpening ---
