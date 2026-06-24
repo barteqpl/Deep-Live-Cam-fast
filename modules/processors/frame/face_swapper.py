@@ -78,23 +78,6 @@ def pre_start() -> bool:
     return True
 
 
-_MASK_CACHE = {}
-
-def get_precomputed_mask(size: int) -> np.ndarray:
-    if size not in _MASK_CACHE:
-        img_white = np.full((size, size), 255, dtype=np.float32)
-        k = max(size // 10, 10)
-        kernel = np.ones((k, k), np.uint8)
-        img_mask = cv2.erode(img_white, kernel, iterations=1)
-        
-        k = max(size // 20, 5)
-        kernel_size = (k, k)
-        blur_size = tuple(2*i+1 for i in kernel_size)
-        img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
-        img_mask /= 255.0
-        _MASK_CACHE[size] = img_mask
-    return _MASK_CACHE[size]
-
 def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
     from insightface.utils import face_align
     
@@ -123,12 +106,31 @@ def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
     IM = cv2.invertAffineTransform(M)
     bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
     
-    mask = get_precomputed_mask(self.input_size[0])
-    img_mask_warped = cv2.warpAffine(mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+    # Original mask pipeline (zero quality degradation), but omitting the unused fake_diff
+    img_white = np.full((aimg.shape[0], aimg.shape[1]), 255, dtype=np.float32)
+    img_white = cv2.warpAffine(img_white, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+    img_white[img_white > 20] = 255
     
-    img_mask_warped = img_mask_warped[:, :, np.newaxis]
+    img_mask = img_white
+    mask_h_inds, mask_w_inds = np.where(img_mask == 255)
+    if len(mask_h_inds) > 0 and len(mask_w_inds) > 0:
+        mask_h = np.max(mask_h_inds) - np.min(mask_h_inds)
+        mask_w = np.max(mask_w_inds) - np.min(mask_w_inds)
+        mask_size = int(np.sqrt(mask_h * mask_w))
+        
+        k = max(mask_size // 10, 10)
+        kernel = np.ones((k, k), np.uint8)
+        img_mask = cv2.erode(img_mask, kernel, iterations=1)
+        
+        k = max(mask_size // 20, 5)
+        kernel_size = (k, k)
+        blur_size = tuple(2*i+1 for i in kernel_size)
+        img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
     
-    fake_merged = img_mask_warped * bgr_fake_warped + (1.0 - img_mask_warped) * img.astype(np.float32)
+    img_mask /= 255.0
+    img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
+    
+    fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)
     return fake_merged.astype(np.uint8)
 
 
