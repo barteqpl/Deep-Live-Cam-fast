@@ -427,7 +427,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     transparency_slider.place(relx=0.35, rely=0.77, relwidth=0.5, relheight=0.02)
 
     # 3) Sharpness label & slider
-    sharpness_var = ctk.DoubleVar(value=0.0)  # start at 0.0
+    sharpness_var = ctk.DoubleVar(value=0.15)  # start at 0.15
     def on_sharpness_change(value: float):
         modules.globals.sharpness = float(value)
         update_status(f"Sharpness set to {value:.1f}")

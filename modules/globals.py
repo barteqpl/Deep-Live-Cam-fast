@@ -55,7 +55,7 @@ fp_ui: Dict[str, bool] = {"face_enhancer": False}
 # Face Swapper Specific Options
 face_swapper_enabled: bool = True # General toggle for the swapper processor
 opacity: float = 1.0              # Blend factor for the swapped face (0.0-1.0)
-sharpness: float = 0.0            # Sharpness enhancement for swapped face (0.0-1.0+)
+sharpness: float = 0.15            # Sharpness enhancement for swapped face (0.0-1.0+)
 
 # Mouth Mask Options
 mouth_mask: bool = False           # Enable mouth area masking/pasting

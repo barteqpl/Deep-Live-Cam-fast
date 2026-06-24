@@ -104,7 +104,7 @@ def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
         return bgr_fake, M
         
     IM = cv2.invertAffineTransform(M)
-    bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+    bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
     
     # Original mask pipeline (zero quality degradation), but omitting the unused fake_diff
     img_white = np.full((aimg.shape[0], aimg.shape[1]), 255, dtype=np.float32)
