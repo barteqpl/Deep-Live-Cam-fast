@@ -193,15 +193,14 @@ def _paste_back(
 
     # Build or reuse cached feathered mask (uint8 — blended via cv2 SIMD ops)
     if _enhancer_cache['mask_size'] != output_size:
-        face_mask_f = np.ones((output_size, output_size), dtype=np.float32)
-        border = max(1, int(output_size * 0.05))
-        ramp_up = np.linspace(0.0, 1.0, border, dtype=np.float32)
-        ramp_down = np.linspace(1.0, 0.0, border, dtype=np.float32)
-        face_mask_f[:border, :] *= ramp_up[:, None]
-        face_mask_f[-border:, :] *= ramp_down[:, None]
-        face_mask_f[:, :border] *= ramp_up[None, :]
-        face_mask_f[:, -border:] *= ramp_down[None, :]
-        _enhancer_cache['mask'] = (face_mask_f * 255.0).astype(np.uint8)
+        scale = output_size / 512.0
+        mask = np.zeros((output_size, output_size), dtype=np.float32)
+        center = (int(256 * scale), int(305 * scale))
+        axes = (int(125 * scale), int(170 * scale))
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 1.0, -1)
+        blur_size = int(45 * scale) | 1  # must be odd
+        mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+        _enhancer_cache['mask'] = (mask * 255.0).astype(np.uint8)
         _enhancer_cache['mask_size'] = output_size
 
     # Compute tight bbox from affine corners (avoids full-frame warpAffine scan)
