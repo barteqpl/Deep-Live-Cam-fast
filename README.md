@@ -55,7 +55,7 @@ This version contains key speed and visual optimizations for real-time performan
 *   **UDP Live Video Streaming**: Low-latency video streaming to a UDP port (`--stream-udp PORT`) for direct VLC or network preview.
 *   **Automatic Model Downloader**: Missing swapper models (including embedding converter ONNX files like `crossface_hififace.onnx` and `crossface_simswap.onnx`) are automatically downloaded from Hugging Face on startup.
 
-For benchmarks and detailed model recommendations, see the [DOCS_MODELS.md](file:///Users/barteq/repos/ai/Deep-Live-Cam/DOCS_MODELS.md) file.
+For benchmarks and detailed model recommendations, see the [DOCS_MODELS.md](DOCS_MODELS.md) file.
 
 ---
 
@@ -182,7 +182,7 @@ pip install git+https://github.com/TencentARC/GFPGAN.git@master
 1.  Download [GFPGANv1.4](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx) and place it in the `models/` directory.
 2.  **Auto-downloading swappers**: All other swapping models (e.g. `simswap_256.onnx`, `hififace_unofficial_256.onnx`, `hyperswap_1a_256.onnx`) and their corresponding embedding converters (`crossface_*.onnx`) are automatically downloaded from Hugging Face on the first run of the application when selected.
 
-For details on the swapper models, see [DOCS_MODELS.md](file:///Users/barteq/repos/ai/Deep-Live-Cam/DOCS_MODELS.md).
+For details on the swapper models, see [DOCS_MODELS.md](DOCS_MODELS.md).
 
 ---
 
