@@ -1,4 +1,4 @@
-<h1 align="center">Deep-Live-Cam 2.1.6</h1>
+<h1 align="center">Deep-Live-Cam-fast-1.0</h1>
 
 <p align="center">
   Real-time face swap and video deepfake with a single click and only a single image.
@@ -43,6 +43,21 @@ Users are expected to use this software responsibly and legally. If using a real
 1. Select a face
 2. Select which camera to use
 3. Press live!
+
+---
+
+## 🚀 High-Performance Optimizations & New Features (Deep-Live-Cam-fast-1.0)
+
+This version contains key speed and visual optimizations for real-time performance, particularly on **Apple Silicon (M4 Pro)**:
+
+*   **256px Swapping Models (CoreML)**: Added support for **SimSwap 256**, **HiFiFace 256**, and **HyperSwap 256** models with optimized CoreML execution, yielding up to **24 FPS** on Mac Silicon.
+*   **Fast Crop Mask Caching**: Erosion and Gaussian blur of the blending mask are pre-computed in the crop space and cached. This drops post-processing overhead from ~15ms to **<0.1ms**, completely fixing edge/border outline artifacts around the head.
+*   **UDP Live Video Streaming**: Low-latency video streaming to a UDP port (`--stream-udp PORT`) for direct VLC or network preview.
+*   **Automatic Model Downloader**: Missing swapper models (including embedding converter ONNX files like `crossface_hififace.onnx` and `crossface_simswap.onnx`) are automatically downloaded from Hugging Face on startup.
+
+For benchmarks and detailed model recommendations, see the [DOCS_MODELS.md](file:///Users/barteq/repos/ai/Deep-Live-Cam/DOCS_MODELS.md) file.
+
+---
 
 ## Features & Uses - Everything is in real-time
 
