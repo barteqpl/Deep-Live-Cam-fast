@@ -449,7 +449,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     sharpness_slider.place(relx=0.35, rely=0.79, relwidth=0.5, relheight=0.02)
 
     # 4) Chin Blend weight label & slider
-    chin_blend_var = ctk.DoubleVar(value=1.0) # start at 1.0
+    chin_blend_var = ctk.DoubleVar(value=0.5) # start at 0.5
     def on_chin_blend_change(value: float):
         modules.globals.chin_blend_weight = float(value)
         update_status(f"Chin blend strength set to {value * 100:.0f}%")

@@ -105,6 +105,48 @@ def get_crop_mask(size: int) -> np.ndarray:
     return _CROP_MASK_CACHE[size]
 
 
+def apply_chin_blend_to_mask(crop_mask: np.ndarray, size: int) -> np.ndarray:
+    """Applies a double-action chin blend to a 2D crop mask of given size.
+    - chin_blend_weight = 0.5: unmodified model mask / ellipse mask.
+    - chin_blend_weight < 0.5: contract/fade out the bottom of the mask (hides beard seams/rectangular lines).
+    - chin_blend_weight > 0.5: expand the mask using the custom ellipse."""
+    chin_weight = getattr(modules.globals, "chin_blend_weight", 0.5)
+    
+    # Clip mask to [0.0, 1.0] float
+    crop_mask = np.clip(crop_mask, 0.0, 1.0).astype(np.float32)
+    y_indices = np.arange(size).reshape(size, 1)
+    
+    if chin_weight < 0.5:
+        # Contraction/Fade-out mode
+        # Map chin_weight [0.5 -> 0.0] to fade factor t [0.0 -> 1.0]
+        t = (0.5 - chin_weight) / 0.5
+        
+        # y_start goes from 0.85 (fades late) to 0.55 (fades early)
+        y_start = 0.85 - 0.30 * t
+        y_end = min(0.98, y_start + 0.15)
+        
+        y_pct = y_indices / float(size)
+        fade = np.clip((y_end - y_pct) / (y_end - y_start), 0.0, 1.0).astype(np.float32)
+        
+        # Apply fade to the bottom area of the crop_mask
+        final_mask = crop_mask * fade
+    else:
+        # Expansion mode
+        # Map chin_weight [0.5 -> 1.0] to expansion factor t [0.0 -> 1.0]
+        t = (chin_weight - 0.5) / 0.5
+        
+        blend_weight = np.clip((y_indices - 100) / 40.0, 0.0, 1.0).astype(np.float32)
+        
+        # Normalise custom ellipse mask
+        eliptic = get_crop_mask(size) / 255.0
+        combined_mask = np.maximum(crop_mask, eliptic)
+        
+        enhanced_mask = (1.0 - blend_weight) * crop_mask + blend_weight * combined_mask
+        final_mask = (1.0 - t) * crop_mask + t * enhanced_mask
+        
+    return final_mask
+
+
 class CrossfaceConverter:
     """Loads and runs a crossface embedding converter ONNX model
     (e.g. crossface_simswap.onnx / crossface_hififace.onnx).
@@ -187,16 +229,7 @@ class HiFiFaceSwapper:
 
         # Process and warp the mask
         mask_fake = pred_mask[0, 0]  # [256, 256]
-        # Smoothly enhance chin coverage using an elliptical mask transition from Y=100 to Y=140
-        y_indices = np.arange(256).reshape(256, 1)
-        blend_weight = np.clip((y_indices - 100) / 40.0, 0.0, 1.0).astype(np.float32)
-        eliptic = get_crop_mask(256) / 255.0
-        combined_mask = np.maximum(mask_fake, eliptic)
-        
-        # Apply chin_blend_weight (0.0 = original model mask, 1.0 = full chin expansion)
-        chin_weight = getattr(modules.globals, "chin_blend_weight", 1.0)
-        enhanced_mask = (1.0 - blend_weight) * mask_fake + blend_weight * combined_mask
-        mask_fake = (1.0 - chin_weight) * mask_fake + chin_weight * enhanced_mask
+        mask_fake = apply_chin_blend_to_mask(mask_fake, 256)
         
         # Apply margin mask to prevent rectangular border bleeding
         mask_fake = mask_fake * get_margin_mask(256)
@@ -265,9 +298,10 @@ class SimSwapSwapper:
         bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
 
         # Paste back using pre-computed crop mask to avoid slow full-frame processing
-        crop_mask = get_crop_mask(self.input_size[0])
+        crop_mask = get_crop_mask(self.input_size[0]) / 255.0
+        crop_mask = apply_chin_blend_to_mask(crop_mask, self.input_size[0])
+        crop_mask = crop_mask * get_margin_mask(self.input_size[0])
         img_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
-        img_mask /= 255.0
         img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
 
         fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)
@@ -321,17 +355,7 @@ class HyperSwapSwapper:
 
         # Use model-generated mask (crop space) -> warp to full frame
         crop_mask = pred_mask[0, 0]  # [256, 256] float
-        crop_mask = np.clip(crop_mask, 0, 1).astype(np.float32)
-        # Smoothly enhance chin coverage using an elliptical mask transition from Y=100 to Y=140
-        y_indices = np.arange(256).reshape(256, 1)
-        blend_weight = np.clip((y_indices - 100) / 40.0, 0.0, 1.0).astype(np.float32)
-        eliptic = get_crop_mask(256) / 255.0
-        combined_mask = np.maximum(crop_mask, eliptic)
-        
-        # Apply chin_blend_weight (0.0 = original model mask, 1.0 = full chin expansion)
-        chin_weight = getattr(modules.globals, "chin_blend_weight", 1.0)
-        enhanced_mask = (1.0 - blend_weight) * crop_mask + blend_weight * combined_mask
-        crop_mask = (1.0 - chin_weight) * crop_mask + chin_weight * enhanced_mask
+        crop_mask = apply_chin_blend_to_mask(crop_mask, 256)
         
         # Apply margin mask to prevent rectangular border bleeding
         crop_mask = crop_mask * get_margin_mask(256)
@@ -463,9 +487,11 @@ def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
     bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
     
     # Paste back using pre-computed crop mask to avoid slow full-frame processing
-    crop_mask = get_crop_mask(aimg.shape[0])
+    size = aimg.shape[0]
+    crop_mask = get_crop_mask(size) / 255.0
+    crop_mask = apply_chin_blend_to_mask(crop_mask, size)
+    crop_mask = crop_mask * get_margin_mask(size)
     img_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
-    img_mask /= 255.0
     img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
     
     fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)

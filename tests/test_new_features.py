@@ -19,7 +19,7 @@ class TestNewFeatures(unittest.TestCase):
         modules.globals.swapper_model = "inswapper"
         modules.globals.execution_providers = ["CPUExecutionProvider"]
         modules.globals.headless = True
-        modules.globals.chin_blend_weight = 1.0
+        modules.globals.chin_blend_weight = 0.5
         _CROP_MASK_CACHE.clear()
 
     def test_crop_mask_cache(self):
