@@ -71,6 +71,7 @@ mouth_mask_size: float = 0.0       # Mouth mask size (0-100; 0=off, 100=mouth to
 # --- START: Added for Frame Interpolation ---
 enable_interpolation: bool = True # Toggle temporal smoothing
 interpolation_weight: float = 0  # Blend weight for current frame (0.0-1.0). Lower=smoother.
+chin_blend_weight: float = 1.0   # Strength of custom chin mask blending (0.0-1.0)
 # --- END: Added for Frame Interpolation ---
 
 # --- END OF FILE globals.py ---

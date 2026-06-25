@@ -61,6 +61,7 @@ def parse_args() -> None:
     program.add_argument('--disable-interpolation', help='disable temporal frame interpolation/smoothing', dest='disable_interpolation', action='store_true', default=False)
     program.add_argument('--interpolation-weight', help='blend weight for current frame in temporal smoothing (0.0-1.0)', dest='interpolation_weight', type=float, default=0.0)
     program.add_argument('--sharpness', help='sharpness enhancement factor for swapped face (0.0-1.0+)', dest='sharpness', type=float, default=0.15)
+    program.add_argument('--chin-blend-weight', help='blend weight for custom chin/jawline mask enhancement (0.0-1.0)', dest='chin_blend_weight', type=float, default=1.0)
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
     program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=[suggest_default_execution_provider()], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
@@ -94,6 +95,7 @@ def parse_args() -> None:
     modules.globals.stream_udp = args.stream_udp
     modules.globals.enable_interpolation = not args.disable_interpolation
     modules.globals.interpolation_weight = args.interpolation_weight
+    modules.globals.chin_blend_weight = args.chin_blend_weight
     modules.globals.sharpness = args.sharpness
     modules.globals.max_memory = args.max_memory
     modules.globals.execution_providers = decode_execution_providers(args.execution_provider)

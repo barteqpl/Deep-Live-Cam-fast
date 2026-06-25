@@ -192,7 +192,11 @@ class HiFiFaceSwapper:
         blend_weight = np.clip((y_indices - 100) / 40.0, 0.0, 1.0).astype(np.float32)
         eliptic = get_crop_mask(256) / 255.0
         combined_mask = np.maximum(mask_fake, eliptic)
-        mask_fake = (1.0 - blend_weight) * mask_fake + blend_weight * combined_mask
+        
+        # Apply chin_blend_weight (0.0 = original model mask, 1.0 = full chin expansion)
+        chin_weight = getattr(modules.globals, "chin_blend_weight", 1.0)
+        enhanced_mask = (1.0 - blend_weight) * mask_fake + blend_weight * combined_mask
+        mask_fake = (1.0 - chin_weight) * mask_fake + chin_weight * enhanced_mask
         
         # Apply margin mask to prevent rectangular border bleeding
         mask_fake = mask_fake * get_margin_mask(256)
@@ -323,7 +327,11 @@ class HyperSwapSwapper:
         blend_weight = np.clip((y_indices - 100) / 40.0, 0.0, 1.0).astype(np.float32)
         eliptic = get_crop_mask(256) / 255.0
         combined_mask = np.maximum(crop_mask, eliptic)
-        crop_mask = (1.0 - blend_weight) * crop_mask + blend_weight * combined_mask
+        
+        # Apply chin_blend_weight (0.0 = original model mask, 1.0 = full chin expansion)
+        chin_weight = getattr(modules.globals, "chin_blend_weight", 1.0)
+        enhanced_mask = (1.0 - blend_weight) * crop_mask + blend_weight * combined_mask
+        crop_mask = (1.0 - chin_weight) * crop_mask + chin_weight * enhanced_mask
         
         # Apply margin mask to prevent rectangular border bleeding
         crop_mask = crop_mask * get_margin_mask(256)

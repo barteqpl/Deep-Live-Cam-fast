@@ -10,7 +10,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 import modules.globals
-from modules.processors.frame.face_swapper import get_crop_mask, _CROP_MASK_CACHE, get_model_name
+from modules.processors.frame.face_swapper import get_crop_mask, _CROP_MASK_CACHE, get_model_name, get_margin_mask, _MARGIN_MASK_CACHE
 from modules.streamer import UDPStreamer
 
 class TestNewFeatures(unittest.TestCase):
@@ -19,6 +19,7 @@ class TestNewFeatures(unittest.TestCase):
         modules.globals.swapper_model = "inswapper"
         modules.globals.execution_providers = ["CPUExecutionProvider"]
         modules.globals.headless = True
+        modules.globals.chin_blend_weight = 1.0
         _CROP_MASK_CACHE.clear()
 
     def test_crop_mask_cache(self):
@@ -96,6 +97,7 @@ class TestNewFeatures(unittest.TestCase):
             "--disable-interpolation",
             "--interpolation-weight", "0.25",
             "--sharpness", "0.45",
+            "--chin-blend-weight", "0.75",
             "--stream-udp", "6000"
         ]
         with patch("sys.argv", test_argv):
@@ -103,6 +105,7 @@ class TestNewFeatures(unittest.TestCase):
                 parse_args()
                 self.assertFalse(modules.globals.enable_interpolation)
                 self.assertEqual(modules.globals.interpolation_weight, 0.25)
+                self.assertEqual(modules.globals.chin_blend_weight, 0.75)
                 self.assertEqual(modules.globals.sharpness, 0.45)
                 self.assertEqual(modules.globals.stream_udp, "6000")
 
@@ -159,6 +162,24 @@ class TestNewFeatures(unittest.TestCase):
                 limit_resources()
             except ValueError:
                 self.fail("limit_resources() raised ValueError unexpectedly!")
+
+    def test_margin_mask_cache(self):
+        _MARGIN_MASK_CACHE.clear()
+        self.assertEqual(len(_MARGIN_MASK_CACHE), 0)
+        
+        mask = get_margin_mask(256)
+        self.assertIsInstance(mask, np.ndarray)
+        self.assertEqual(mask.shape, (256, 256))
+        self.assertEqual(mask.dtype, np.float32)
+        
+        # Check boundary values are 0.0
+        self.assertEqual(mask[0, 0], 0.0)
+        self.assertEqual(mask[255, 255], 0.0)
+        
+        # Check center value is 1.0
+        self.assertEqual(mask[128, 128], 1.0)
+        
+        self.assertIn(256, _MARGIN_MASK_CACHE)
 
 if __name__ == "__main__":
     unittest.main()
