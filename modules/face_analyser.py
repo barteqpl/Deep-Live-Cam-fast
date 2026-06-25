@@ -19,12 +19,10 @@ DET_SIZE = (640, 640)
 
 
 def get_face_analyser() -> Any:
-    """Get face analyser with thread-safe initialization."""
     global FACE_ANALYSER
 
     if FACE_ANALYSER is None:
         with FACE_ANALYSER_LOCK:
-            # Double-check after acquiring lock
             if FACE_ANALYSER is None:
                 from modules.processors.frame._onnx_enhancer import (
                     build_provider_config,
@@ -214,6 +212,77 @@ def ensure_landmarks(frame: Frame, faces: Any) -> None:
                 lmk_model.get(frame, face)
             except Exception as e:  # pragma: no cover - never break the swap
                 print(f"Error computing 2d106 landmarks: {e}")
+
+
+class FaceTracker:
+    def __init__(self):
+        self.prev_gray = None
+        self.tracked_faces = []
+
+    def update(self, frame: np.ndarray, detected_faces: list = None) -> list:
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # If new detections are provided, or if we have no tracked faces, reset tracking
+        if detected_faces is not None or not self.tracked_faces or self.prev_gray is None:
+            self.prev_gray = curr_gray
+            self.tracked_faces = []
+            if detected_faces:
+                from insightface.app.common import Face
+                for face in detected_faces:
+                    if face is not None and hasattr(face, 'kps') and face.kps is not None:
+                        cloned_face = Face()
+                        for k, v in face.items():
+                            if hasattr(v, 'copy'):
+                                cloned_face[k] = v.copy()
+                            else:
+                                cloned_face[k] = v
+                        self.tracked_faces.append(cloned_face)
+            return self.tracked_faces
+
+        # Perform tracking of existing faces
+        lk_params = dict(winSize=(15, 15),
+                         maxLevel=2,
+                         criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03))
+        
+        next_tracked_faces = []
+        for face in self.tracked_faces:
+            if not hasattr(face, 'kps') or face.kps is None:
+                continue
+            p0 = face.kps.reshape(-1, 1, 2).astype(np.float32)
+            p1, st, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, curr_gray, p0, None, **lk_params)
+            st = st.reshape(-1)
+            if np.sum(st) >= 3:
+                # Successfully tracked
+                tracked_p0 = p0.reshape(-1, 2)[st == 1]
+                tracked_p1 = p1.reshape(-1, 2)[st == 1]
+                displacement = tracked_p1 - tracked_p0
+                mean_displacement = np.mean(displacement, axis=0)
+                
+                # Update kps
+                new_kps = face.kps.copy()
+                for i in range(5):
+                    if st[i] == 1:
+                        new_kps[i] = p1[i, 0]
+                    else:
+                        new_kps[i] = face.kps[i] + mean_displacement
+                
+                # Update bbox
+                new_bbox = face.bbox.copy()
+                new_bbox[0] += mean_displacement[0]
+                new_bbox[1] += mean_displacement[1]
+                new_bbox[2] += mean_displacement[0]
+                new_bbox[3] += mean_displacement[1]
+                
+                face.kps = new_kps
+                face.bbox = new_bbox
+                next_tracked_faces.append(face)
+            else:
+                # Tracking lost for this face, drop it
+                pass
+                
+        self.prev_gray = curr_gray
+        self.tracked_faces = next_tracked_faces
+        return self.tracked_faces
 
 
 def has_valid_map() -> bool:

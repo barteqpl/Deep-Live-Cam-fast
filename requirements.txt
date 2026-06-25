@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
 numpy>=1.23.5,<2
 typing-extensions>=4.8.0
 opencv-python==4.10.0.84
@@ -5,13 +7,16 @@ cv2_enumerate_cameras==1.1.15
 onnx==1.18.0
 insightface==0.7.3
 psutil==5.9.8
-PySide6>=6.7,<7
-pillow==12.1.1
-tqdm>=4.65.0
-onnxruntime-silicon==1.16.3; sys_platform == 'darwin' and platform_machine == 'arm64'
-onnxruntime-gpu==1.23.2; sys_platform != 'darwin'
-tensorflow>=2.15.0; sys_platform != 'darwin'
-tensorflow>=2.15.0; sys_platform == 'darwin' and python_version < '3.13'
+tk==0.1.0
+customtkinter==5.2.2
+pillow==11.1.0
+torch; sys_platform != 'darwin'
+torch; sys_platform == 'darwin'
+torchvision; sys_platform != 'darwin'
+torchvision; sys_platform == 'darwin'
+onnxruntime==1.19.2; sys_platform == 'darwin'
+onnxruntime-gpu==1.22.0; sys_platform != 'darwin'
+tensorflow; sys_platform != 'darwin'
 opennsfw2==0.10.2
 protobuf==4.25.1
-pygrabber; sys_platform == 'win32'
+pygrabber

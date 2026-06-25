@@ -1,15 +1,13 @@
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional
 import cv2
 import insightface
-import logging
 import threading
 import numpy as np
 import platform
 import modules.globals
 import modules.processors.frame.core
-from modules import imread_unicode, imwrite_unicode
 from modules.core import update_status
-from modules.face_analyser import get_one_face, get_many_faces, default_source_face
+from modules.face_analyser import get_one_face, get_many_faces, default_source_face, FaceTracker
 from modules.typing import Face, Frame
 from modules.utilities import (
     conditional_download,
@@ -17,10 +15,285 @@ from modules.utilities import (
     is_video,
 )
 from modules.cluster_analysis import find_closest_centroid
-from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
+from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize, gpu_cvt_color
 import os
 from collections import deque
 import time
+
+
+# FaceFusion-compatible warp templates for face alignment.
+# These differ subtly from insightface's built-in templates and must match
+# what the ONNX models were trained on.
+WARP_TEMPLATES = {
+    'arcface_112_v1': np.array([
+        [0.35473214, 0.45658929],
+        [0.64526786, 0.45658929],
+        [0.50000000, 0.61154464],
+        [0.37913393, 0.77687500],
+        [0.62086607, 0.77687500]
+    ]),
+    'arcface_128': np.array([
+        [0.36167656, 0.40387734],
+        [0.63696719, 0.40235469],
+        [0.50019687, 0.56044219],
+        [0.38710391, 0.72160547],
+        [0.61507734, 0.72034453]
+    ]),
+    'mtcnn_512': np.array([
+        [0.36562865, 0.46733799],
+        [0.63305391, 0.46585885],
+        [0.50019127, 0.61942959],
+        [0.39032951, 0.77598822],
+        [0.61178945, 0.77476328]
+    ]),
+}
+
+def _warp_face_by_template(img, kps, template_name, crop_size):
+    """Warp a face using FaceFusion's template-based alignment.
+    Returns the cropped+aligned face and the affine matrix."""
+    template = WARP_TEMPLATES[template_name] * np.array(crop_size, dtype=np.float32)
+    M = cv2.estimateAffinePartial2D(
+        kps.astype(np.float32), template.astype(np.float32),
+        method=cv2.RANSAC, ransacReprojThreshold=100
+    )[0]
+    crop = cv2.warpAffine(
+        img, M, tuple(crop_size),
+        borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA
+    )
+    return crop, M
+
+
+_CROP_MASK_CACHE = {}
+
+def get_crop_mask(size: int) -> np.ndarray:
+    """Pre-computes and caches elliptical crop masks to avoid expensive CPU-based
+    erode/blur operations on full frame sizes, while preventing box artifacts."""
+    if size not in _CROP_MASK_CACHE:
+        mask = np.zeros((size, size), dtype=np.float32)
+        center = (size // 2, int(size * 0.50)) # Center of face
+        axes = (int(size * 0.38), int(size * 0.45)) # Face-like ellipse
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+        
+        # Apply Gaussian blur to feather the boundary smoothly
+        k_blur = max(size // 8, 5)
+        if k_blur % 2 == 0:
+            k_blur += 1
+        mask = cv2.GaussianBlur(mask, (k_blur, k_blur), 0)
+        _CROP_MASK_CACHE[size] = mask
+    return _CROP_MASK_CACHE[size]
+
+
+class CrossfaceConverter:
+    """Loads and runs a crossface embedding converter ONNX model
+    (e.g. crossface_simswap.onnx / crossface_hififace.onnx).
+    These small networks (~22 MB) transform the raw ArcFace embedding
+    into the representation that SimSwap/HiFiFace were trained with."""
+
+    def __init__(self, model_path: str):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(
+            model_path, providers=['CPUExecutionProvider']
+        )
+
+    def convert(self, raw_embedding: np.ndarray) -> np.ndarray:
+        """Convert raw ArcFace embedding -> model-specific embedding.
+        Input shape: (512,) or (1, 512).  Returns shape (1, 512) float32."""
+        inp = raw_embedding.reshape(-1, 512).astype(np.float32)
+        out = self.session.run(None, {'input': inp})[0]
+        out = out.ravel()
+        out_norm = out / np.linalg.norm(out)
+        return out_norm.reshape(1, -1).astype(np.float32)
+
+
+class HiFiFaceSwapper:
+    def __init__(self, model_path: str, providers: list, provider_options: list = None):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.input_names = [inp.name for inp in self.session.get_inputs()]
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.input_size = (256, 256)
+        # FaceFusion config for hififace_unofficial_256
+        self.template = 'mtcnn_512'
+        self.mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        self.std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        # Load crossface embedding converter
+        self.crossface = None
+        for candidate in [
+            os.path.join(models_dir, 'crossface_hififace.onnx'),
+        ]:
+            if os.path.exists(candidate):
+                self.crossface = CrossfaceConverter(candidate)
+                update_status(f"HiFiFace crossface converter loaded from: {candidate}", "DLC.FACE-SWAPPER")
+                break
+        if self.crossface is None:
+            update_status("WARNING: crossface_hififace.onnx not found - identity transfer may be degraded", "DLC.FACE-SWAPPER")
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        # 1. Align face using FaceFusion's mtcnn_512 template
+        aimg, M = _warp_face_by_template(img, target_face.kps, self.template, self.input_size)
+
+        # 2. Preprocess: BGR -> RGB, normalize with mean/std
+        crop_rgb = aimg[:, :, ::-1].astype(np.float32) / 255.0
+        crop_rgb = (crop_rgb - self.mean) / self.std
+        blob = crop_rgb.transpose(2, 0, 1)
+        blob = np.expand_dims(blob, axis=0).astype(np.float32)
+
+        # 3. Convert source embedding through crossface converter
+        if self.crossface is not None:
+            latent = self.crossface.convert(source_face.embedding).copy()
+        else:
+            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+
+        # 4. Inference
+        with THREAD_LOCK:
+            pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
+        pred_img = pred[0]
+        pred_mask = pred[1]
+
+        # 5. Denormalize output (FaceFusion: x * std + mean, clip [0,1], BGR, *255)
+        img_fake = pred_img[0].transpose((1, 2, 0))  # [256, 256, 3] RGB
+        img_fake = img_fake * self.std + self.mean
+        img_fake = np.clip(img_fake, 0, 1)
+        bgr_fake = (img_fake[:, :, ::-1] * 255).astype(np.uint8)
+
+        if not paste_back:
+            return bgr_fake, M
+
+        # 6. Paste back into original frame using model's output mask
+        IM = cv2.invertAffineTransform(M)
+        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
+
+        # Process and warp the mask
+        mask_fake = pred_mask[0, 0]  # [256, 256]
+        mask_warped = cv2.warpAffine(mask_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
+        mask_warped = np.reshape(mask_warped, [mask_warped.shape[0], mask_warped.shape[1], 1])
+
+        # Blend images: mask * swapped + (1 - mask) * original
+        fake_merged = mask_warped * bgr_fake_warped.astype(np.float32) + (1.0 - mask_warped) * img.astype(np.float32)
+        return fake_merged.astype(np.uint8)
+
+class SimSwapSwapper:
+    def __init__(self, model_path: str, providers: list, provider_options: list = None):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.input_names = [inp.name for inp in self.session.get_inputs()]
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.input_size = (256, 256)
+        # FaceFusion config for simswap_256
+        self.template = 'arcface_112_v1'
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # Load crossface embedding converter
+        self.crossface = None
+        for candidate in [
+            os.path.join(models_dir, 'crossface_simswap.onnx'),
+        ]:
+            if os.path.exists(candidate):
+                self.crossface = CrossfaceConverter(candidate)
+                update_status(f"SimSwap crossface converter loaded from: {candidate}", "DLC.FACE-SWAPPER")
+                break
+        if self.crossface is None:
+            update_status("WARNING: crossface_simswap.onnx not found - identity transfer may be degraded", "DLC.FACE-SWAPPER")
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        # 1. Align face using FaceFusion's arcface_112_v1 template
+        aimg, M = _warp_face_by_template(img, target_face.kps, self.template, self.input_size)
+
+        # 2. Preprocess: BGR -> RGB, ImageNet normalization
+        crop_rgb = aimg[:, :, ::-1].astype(np.float32) / 255.0
+        crop_rgb = (crop_rgb - self.mean) / self.std
+        blob = crop_rgb.transpose(2, 0, 1)
+        blob = np.expand_dims(blob, axis=0).astype(np.float32)
+
+        # 3. Convert source embedding through crossface converter
+        if self.crossface is not None:
+            latent = self.crossface.convert(source_face.embedding).copy()
+        else:
+            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+
+        # 4. Inference
+        with THREAD_LOCK:
+            pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
+        pred_img = pred[0]
+
+        # 5. Denormalize output: SimSwap outputs in [0, 1] range, no need for std/mean reversal
+        img_fake = pred_img[0].transpose((1, 2, 0))  # [256, 256, 3] in RGB
+        img_fake = np.clip(img_fake, 0, 1)
+        bgr_fake = (img_fake[:, :, ::-1] * 255).astype(np.uint8)
+
+        if not paste_back:
+            return bgr_fake, M
+
+        # 6. Paste back using standard mask pipeline (scaled for 256x256)
+        IM = cv2.invertAffineTransform(M)
+        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
+
+        # Paste back using pre-computed crop mask to avoid slow full-frame processing
+        crop_mask = get_crop_mask(self.input_size[0])
+        img_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+        img_mask /= 255.0
+        img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
+
+        fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)
+        return fake_merged.astype(np.uint8)
+
+
+class HyperSwapSwapper:
+    """FaceFusion's HyperSwap model (2025) - high quality, no crossface converter needed.
+    Uses arcface_128 template, mean/std = [0.5, 0.5, 0.5], normed_embedding directly."""
+    def __init__(self, model_path: str, providers: list, provider_options: list = None):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.input_names = [inp.name for inp in self.session.get_inputs()]
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.input_size = (256, 256)
+        self.template = 'arcface_128'
+        self.mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        self.std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        # 1. Align face using FaceFusion's arcface_128 template
+        aimg, M = _warp_face_by_template(img, target_face.kps, self.template, self.input_size)
+
+        # 2. Preprocess: BGR -> RGB, normalize with mean/std -> [-1, 1]
+        crop_rgb = aimg[:, :, ::-1].astype(np.float32) / 255.0
+        crop_rgb = (crop_rgb - self.mean) / self.std
+        blob = crop_rgb.transpose(2, 0, 1)
+        blob = np.expand_dims(blob, axis=0).astype(np.float32)
+
+        # 3. HyperSwap uses normed_embedding directly (no crossface needed)
+        latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+
+        # 4. Inference - HyperSwap input order: source=embedding, target=image
+        with THREAD_LOCK:
+            pred = self.session.run(self.output_names, {'source': latent, 'target': blob})
+        pred_img = pred[0]
+        pred_mask = pred[1]  # HyperSwap outputs a mask [1, 1, 256, 256]
+
+        # 5. Denormalize: x * std + mean, clip [0,1], convert to BGR uint8
+        img_fake = pred_img[0].transpose((1, 2, 0))
+        img_fake = img_fake * self.std + self.mean
+        img_fake = np.clip(img_fake, 0, 1)
+        bgr_fake = (img_fake[:, :, ::-1] * 255).astype(np.uint8)
+
+        if not paste_back:
+            return bgr_fake, M
+
+        # 6. Paste back using model's built-in mask (faster than manual erode/blur)
+        IM = cv2.invertAffineTransform(M)
+        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
+
+        # Use model-generated mask (crop space) -> warp to full frame
+        crop_mask = pred_mask[0, 0]  # [256, 256] float
+        crop_mask = np.clip(crop_mask, 0, 1).astype(np.float32)
+        full_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+        # Slight blur for smoother blending
+        full_mask = cv2.GaussianBlur(full_mask, (5, 5), 0)
+        full_mask = np.reshape(full_mask, [full_mask.shape[0], full_mask.shape[1], 1])
+
+        fake_merged = full_mask * bgr_fake_warped + (1.0 - full_mask) * img.astype(np.float32)
+        return fake_merged.astype(np.uint8)
+
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
@@ -30,199 +303,123 @@ NAME = "DLC.FACE-SWAPPER"
 PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previous step
 # --- END: Added for Interpolation ---
 
-# --- Poisson blend (ported from deep-live-cam-gumroad-edition) ---
-# Root-cause fix for the "wobble": the blend mask is NOT built from the
-# independently-detected 106-pt landmarks (they jitter sub-pixel every frame
-# and seamlessClone is hyper-sensitive to its mask boundary). Instead it is
-# derived from the swap's OWN affine transform (M) + the swapped pixels
-# (bgr_fake), so the mask is locked exactly to where the swapped face was
-# placed — no independent jitter source, no EMA, no lag. The mask is cached
-# when the face is nearly still so an identical array is reused (zero wobble).
-_ELLIPTICAL_MASK_CACHE: dict = {}
-_poisson_cached_mask: Optional[np.ndarray] = None
-_poisson_cached_key: Optional[tuple] = None
+# --- START: Live stream detection-skip optimization ---
+_LIVE_DETECTION_COUNTER: int = 0
+_LIVE_LAST_FACES: list = []
+LIVE_DETECTION_INTERVAL: int = 1  # Detect every N frames
+LIVE_TRACKER = None
+# --- END: Live stream detection-skip optimization ---
 
-
-def _create_elliptical_mask(size: Tuple[int, int]) -> np.ndarray:
-    """Fixed, heavily-blurred elliptical mask in aligned-face space.
-
-    Geometry-based (not content-adaptive) and cached by size — identical
-    every frame for the same model input size, so it contributes no jitter.
-    """
-    global _ELLIPTICAL_MASK_CACHE
-    if size in _ELLIPTICAL_MASK_CACHE:
-        return _ELLIPTICAL_MASK_CACHE[size]
-    h, w = size
-    center = (w // 2, h // 2)
-    axes = (int(w * 0.44), int(h * 0.44))
-    mask = np.zeros((h, w), dtype=np.float32)
-    cv2.ellipse(mask, center, axes, 0, 0, 360, 1, -1)
-    if h * w < 65536:
-        mask = cv2.GaussianBlur(mask, (31, 31), 12)
-    else:
-        mask = gpu_gaussian_blur(mask, (31, 31), 12)
-    _ELLIPTICAL_MASK_CACHE[size] = mask
-    return mask
-
-
-def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
-                         target_face: Face, affine_matrix: np.ndarray = None,
-                         bgr_fake: np.ndarray = None) -> Frame:
-    """Poisson-blend the swapped face onto the original frame.
-
-    Preferred path derives the blend mask from the swap's inverse affine so
-    it tracks the swapped face exactly per-frame (no landmark jitter, no
-    smoothing). Falls back to a cached bbox-ellipse if the affine is absent.
-    Writes only the blended ellipse back so other faces are preserved.
-    """
-    global _poisson_cached_mask, _poisson_cached_key
-    try:
-        # ---- Preferred: blend ONLY the genuinely-swapped region ----
-        # Use the exact paste-back mask (warped elliptical mask), eroded so
-        # the Poisson seam sits on solidly-swapped pixels only.
-        if affine_matrix is not None and bgr_fake is not None:
-            try:
-                h, w = swapped_frame.shape[:2]
-                fh, fw = bgr_fake.shape[:2]
-                inv = cv2.invertAffineTransform(affine_matrix)
-                corners = np.array([[0, 0, 1], [fw, 0, 1], [fw, fh, 1], [0, fh, 1]],
-                                   dtype=np.float32)
-                t = corners @ inv.T
-                px1 = max(0, int(np.floor(t[:, 0].min())))
-                py1 = max(0, int(np.floor(t[:, 1].min())))
-                px2 = min(w, int(np.ceil(t[:, 0].max())))
-                py2 = min(h, int(np.ceil(t[:, 1].max())))
-                rw, rh = px2 - px1, py2 - py1
-                if rw > 8 and rh > 8:
-                    roi_aff = inv.copy()
-                    roi_aff[0, 2] -= px1
-                    roi_aff[1, 2] -= py1
-                    fm = _create_elliptical_mask((fh, fw))
-                    mroi = cv2.warpAffine(fm, roi_aff, (rw, rh),
-                                          flags=cv2.INTER_LINEAR,
-                                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-                    bin_roi = np.where(mroi > 0.5, np.uint8(255), np.uint8(0))
-                    k = max(3, (min(rw, rh) // 20) | 1)
-                    bin_roi = cv2.erode(bin_roi,
-                                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-                    bx, by, bw, bh = cv2.boundingRect(bin_roi)
-                    if bw > 0 and bh > 0:
-                        mx1, my1 = px1 + bx, py1 + by
-                        mx2, my2 = mx1 + bw - 1, my1 + bh - 1
-                        # seamlessClone needs the cloned region off the border
-                        if mx1 > 0 and my1 > 0 and mx2 < w - 1 and my2 < h - 1:
-                            mask = np.zeros((h, w), dtype=np.uint8)
-                            mask[py1:py2, px1:px2] = bin_roi
-                            center = (mx1 + bw // 2, my1 + bh // 2)
-                            blended = cv2.seamlessClone(swapped_frame, original_frame,
-                                                        mask, center, cv2.NORMAL_CLONE)
-                            np.copyto(swapped_frame[my1:my2 + 1, mx1:mx2 + 1],
-                                      blended[my1:my2 + 1, mx1:mx2 + 1],
-                                      where=mask[my1:my2 + 1, mx1:mx2 + 1, None].astype(bool))
-                            return swapped_frame
-            except Exception:
-                pass  # fall through to the robust bbox-ellipse path below
-        # ---- Fallback: bbox-ellipse (defensive, cached when still) ----
-        if not hasattr(target_face, 'bbox') or target_face.bbox is None:
-            return swapped_frame
-        x1, y1, x2, y2 = target_face.bbox.astype(int)
-        h, w = swapped_frame.shape[:2]
-        x1, y1 = (max(0, x1), max(0, y1))
-        x2, y2 = (min(w, x2), min(h, y2))
-        if x2 <= x1 or y2 <= y1 or x2 - x1 <= 10 or (y2 - y1 <= 10):
-            return swapped_frame
-        padding = int(min(x2 - x1, y2 - y1) * 0.1)
-        x1_p = max(0, x1 - padding)
-        y1_p = max(0, y1 - padding)
-        x2_p = min(w, x2 + padding)
-        y2_p = min(h, y2 + padding)
-        center_x = int(round((x1 + x2) / 2.0))
-        center_y = int(round((y1 + y2) / 2.0))
-        radius_x = max(1, int(round((x2_p - x1_p) / 2.0)))
-        radius_y = max(1, int(round((y2_p - y1_p) / 2.0)))
-        if not (0 <= center_x < w and 0 <= center_y < h):
-            return swapped_frame
-        center = (center_x, center_y)
-        if center_x - radius_x < 0 or center_x + radius_x >= w or center_y - radius_y < 0 or (center_y + radius_y >= h):
-            return swapped_frame
-        # Reuse cached mask when center/radius unchanged frame-to-frame
-        # (face nearly still) — saves the np.zeros + cv2.ellipse, and the
-        # identical array means literally zero wobble while still.
-        mask_key = (center_x, center_y, radius_x, radius_y, h, w)
-        if _poisson_cached_key == mask_key and _poisson_cached_mask is not None:
-            mask = _poisson_cached_mask
-        else:
-            mask = np.zeros((h, w), dtype=np.uint8)
-            cv2.ellipse(mask, center, (radius_x, radius_y), 0, 0, 360, 255, -1)
-            if np.sum(mask) == 0:
-                return swapped_frame
-            _poisson_cached_mask = mask
-            _poisson_cached_key = mask_key
-        blended = cv2.seamlessClone(swapped_frame, original_frame, mask, center, cv2.NORMAL_CLONE)
-        # Composite ONLY this face's ellipse back (ROI-bounded) so previously
-        # blended faces in multi-face mode are preserved.
-        rx0 = max(0, center_x - radius_x)
-        rx1 = min(w, center_x + radius_x + 1)
-        ry0 = max(0, center_y - radius_y)
-        ry1 = min(h, center_y + radius_y + 1)
-        roi_mask = mask[ry0:ry1, rx0:rx1]
-        np.copyto(swapped_frame[ry0:ry1, rx0:rx1],
-                  blended[ry0:ry1, rx0:rx1],
-                  where=roi_mask[:, :, None].astype(bool))
-        return swapped_frame
-    except Exception:
-        return swapped_frame
-
-# --- START: Mac M1-M5 Optimizations ---
 IS_APPLE_SILICON = platform.system() == 'Darwin' and platform.machine() == 'arm64'
-FRAME_CACHE = deque(maxlen=3)  # Cache for frame reuse
-FACE_DETECTION_CACHE = {}  # Cache face detections
-LAST_DETECTION_TIME = 0
-DETECTION_INTERVAL = 0.033  # ~30 FPS detection rate for live mode
-FRAME_SKIP_COUNTER = 0
-ADAPTIVE_QUALITY = True
-# --- END: Mac M1-M5 Optimizations ---
 
 abs_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(abs_dir))), "models"
 )
 
+def get_model_name() -> str:
+    swapper_model = getattr(modules.globals, "swapper_model", "inswapper")
+    if swapper_model == "hififace":
+        return "hififace_unofficial_256.onnx"
+    elif swapper_model == "simswap":
+        return "simswap_256.onnx"
+    elif swapper_model == "hyperswap":
+        return "hyperswap_1a_256.onnx"
+    # Use FP32 model on Apple Silicon with CoreML because FP16 has extreme partitioning overhead in CoreML EP
+    if IS_APPLE_SILICON and modules.globals.execution_providers and "CoreMLExecutionProvider" in modules.globals.execution_providers:
+        return "inswapper_128.onnx"
+    return "inswapper_128_fp16.onnx"
+
+
 def pre_check() -> bool:
-    # Use models_dir instead of abs_dir to save to the correct location
     download_directory_path = models_dir
+    model_name = get_model_name()
+    urls = []
     
-    # Make sure the models directory exists, catch permission errors if they occur
-    try:
-        os.makedirs(download_directory_path, exist_ok=True)
-    except OSError as e:
-        logging.error(f"Failed to create directory {download_directory_path} due to permission error: {e}")
-        return False
-    
-    # Use the direct download URL from Hugging Face (FP32 model for broad GPU compatibility)
+    if model_name == "hififace_unofficial_256.onnx":
+        urls.append("https://huggingface.co/facefusion/models-3.1.0/resolve/main/hififace_unofficial_256.onnx")
+        urls.append("https://huggingface.co/facefusion/models-3.4.0/resolve/main/crossface_hififace.onnx")
+    elif model_name == "simswap_256.onnx":
+        urls.append("https://huggingface.co/facefusion/models-3.0.0/resolve/main/simswap_256.onnx")
+        urls.append("https://huggingface.co/facefusion/models-3.4.0/resolve/main/crossface_simswap.onnx")
+    elif model_name == "hyperswap_1a_256.onnx":
+        urls.append("https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1a_256.onnx")
+    elif model_name == "inswapper_128.onnx":
+        urls.append("https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx")
+    else:
+        urls.append("https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx")
+        
     conditional_download(
         download_directory_path,
-        [
-            "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128.onnx"
-        ],
+        urls,
     )
     return True
 
 
 def pre_start() -> bool:
-    # Check for either model variant
-    fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-    fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
-    if not os.path.exists(fp16_path) and not os.path.exists(fp32_path):
-        update_status(f"Model not found in {models_dir}. Please download inswapper_128.onnx.", NAME)
+    model_name = get_model_name()
+    model_path = os.path.join(models_dir, model_name)
+    if not os.path.exists(model_path):
+        update_status(f"Model not found: {model_path}. Please download it.", NAME)
         return False
+
+    if model_name == "hififace_unofficial_256.onnx":
+        crossface_path = os.path.join(models_dir, "crossface_hififace.onnx")
+        if not os.path.exists(crossface_path):
+            update_status(f"Crossface converter not found: {crossface_path}. Please download it.", NAME)
+            return False
+    elif model_name == "simswap_256.onnx":
+        crossface_path = os.path.join(models_dir, "crossface_simswap.onnx")
+        if not os.path.exists(crossface_path):
+            update_status(f"Crossface converter not found: {crossface_path}. Please download it.", NAME)
+            return False
 
     # Try to get the face swapper to ensure it loads correctly
     if get_face_swapper() is None:
         # Error message already printed within get_face_swapper
         return False
 
+    # Add other essential checks if needed, e.g., target/source path validity
     return True
+
+
+
+def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
+    from insightface.utils import face_align
+    
+    aimg, M = face_align.norm_crop2(img, target_face.kps, self.input_size[0])
+    blob = cv2.dnn.blobFromImage(aimg, 1.0 / self.input_std, self.input_size,
+                                  (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
+    
+    latent = source_face.get("_inswapper_latent", None)
+    if latent is None:
+        latent = source_face.normed_embedding.reshape((1,-1))
+        latent = np.dot(latent, self.emap)
+        latent /= np.linalg.norm(latent)
+        latent = latent.astype(np.float32)
+        source_face._inswapper_latent = latent
+        
+    # Crucial: create a copy to avoid ONNX Runtime CoreML EP memory address caching crash
+    latent = latent.copy()
+    
+    pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})[0]
+    img_fake = pred.transpose((0,2,3,1))[0]
+    bgr_fake = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:,:,::-1]
+    
+    if not paste_back:
+        return bgr_fake, M
+        
+    IM = cv2.invertAffineTransform(M)
+    bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
+    
+    # Paste back using pre-computed crop mask to avoid slow full-frame processing
+    crop_mask = get_crop_mask(aimg.shape[0])
+    img_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+    img_mask /= 255.0
+    img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
+    
+    fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)
+    return fake_merged.astype(np.uint8)
 
 
 def get_face_swapper() -> Any:
@@ -230,273 +427,47 @@ def get_face_swapper() -> Any:
 
     with THREAD_LOCK:
         if FACE_SWAPPER is None:
-            # Prefer FP16 on GPUs with Tensor Cores (Turing+) — half the
-            # memory bandwidth, faster inference.  Fall back to FP32 for
-            # older GPUs (e.g. GTX 16xx) where FP16 can produce NaN.
-            fp32_path = os.path.join(models_dir, "inswapper_128.onnx")
-            fp16_path = os.path.join(models_dir, "inswapper_128_fp16.onnx")
-            use_fp16 = _HAS_TORCH_CUDA and os.path.exists(fp16_path)
-            if use_fp16:
-                model_path = fp16_path
-            elif os.path.exists(fp32_path):
-                model_path = fp32_path
-            else:
-                update_status(f"No inswapper model found in {models_dir}.", NAME)
-                return None
-            # On Apple Silicon, rewrite Pad(reflect) → Slice+Concat so
-            # CoreML can run the entire model in a single partition on
-            # the Neural Engine instead of bouncing between CPU and ANE.
-            if IS_APPLE_SILICON:
-                from modules.onnx_optimize import optimize_for_coreml
-                model_path = optimize_for_coreml(model_path)
-
+            model_name = get_model_name()
+            model_path = os.path.join(models_dir, model_name)
             update_status(f"Loading face swapper model from: {model_path}", NAME)
             try:
+                # Optimized provider configuration for Apple Silicon
                 providers_config = []
                 for p in modules.globals.execution_providers:
                     if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
-                        # Enhanced CoreML configuration for M1-M5
+                        # CoreML configuration for Apple Silicon
                         providers_config.append((
                             "CoreMLExecutionProvider",
                             {
                                 "ModelFormat": "MLProgram",
-                                "MLComputeUnits": "ALL",  # Use Neural Engine + GPU + CPU
+                                "MLComputeUnits": "CPUAndGPU",
                                 "SpecializationStrategy": "FastPrediction",
-                                "AllowLowPrecisionAccumulationOnGPU": 1,
+                                "AllowLowPrecisionAccumulationOnGPU": 0,
                                 "EnableOnSubgraphs": 1,
                             }
                         ))
-                    elif p == "CUDAExecutionProvider":
-                        # Use bare provider — ONNX Runtime defaults are
-                        # fastest on modern GPUs (Blackwell/sm_120).
-                        providers_config.append(p)
                     else:
                         providers_config.append(p)
-                FACE_SWAPPER = insightface.model_zoo.get_model(
-                    model_path,
-                    providers=providers_config,
-                )
-                # Set up CUDA graph session for faster inference
-                if _HAS_TORCH_CUDA and any(
-                    p == "CUDAExecutionProvider" or
-                    (isinstance(p, tuple) and p[0] == "CUDAExecutionProvider")
-                    for p in providers_config
-                ):
-                    _init_cuda_graph_session(model_path, FACE_SWAPPER)
-                update_status("Face swapper model loaded successfully.", NAME)
+                
+                if model_name == "hififace_unofficial_256.onnx":
+                    FACE_SWAPPER = HiFiFaceSwapper(model_path, providers=providers_config)
+                elif model_name == "simswap_256.onnx":
+                    FACE_SWAPPER = SimSwapSwapper(model_path, providers=providers_config)
+                elif model_name == "hyperswap_1a_256.onnx":
+                    FACE_SWAPPER = HyperSwapSwapper(model_path, providers=providers_config)
+                else:
+                    FACE_SWAPPER = insightface.model_zoo.get_model(
+                        model_path,
+                        providers=providers_config,
+                    )
+                    import types
+                    FACE_SWAPPER.get = types.MethodType(optimized_swapper_get, FACE_SWAPPER)
+                update_status(f"Face swapper model ({model_name}) loaded successfully with CoreML M4 Pro optimizations.", NAME)
             except Exception as e:
                 update_status(f"Error loading face swapper model: {e}", NAME)
                 FACE_SWAPPER = None
                 return None
     return FACE_SWAPPER
-
-
-_HAS_TORCH_CUDA = False
-try:
-    import torch
-    if torch.cuda.is_available():
-        _HAS_TORCH_CUDA = True
-except ImportError:
-    pass
-
-# Cache for paste-back
-_paste_cache = {
-    'soft_alpha': None,  # feathered alpha mask in aligned-face space
-    'alpha_size': 0,
-}
-
-
-def _get_soft_alpha(size: int) -> np.ndarray:
-    """Feathered alpha template in aligned-face space, cached.
-
-    The legacy paste-back eroded and Gaussian-blurred the warped mask in
-    output coordinates with kernels scaled to the output face size, which
-    made the per-frame cost quartic in face linear size. Doing the same
-    erode+blur once in aligned space and then warping the *soft* mask
-    per-frame gives a visually equivalent feather at O(crop_area) cost —
-    the feather radius scales naturally with the affine transform.
-    """
-    if _paste_cache['alpha_size'] != size:
-        # Elliptical (not square) template — matches the gumroad edition's
-        # _create_elliptical_mask. A full/eroded square leaves the aligned
-        # crop's corners near-opaque, so the swapped square's straight edges
-        # show as a visible box on the face. An ellipse (axes 0.44*size) zeroes
-        # the corners and the heavy blur feathers smoothly into the original.
-        center = (size // 2, size // 2)
-        axes = (int(size * 0.44), int(size * 0.44))
-        mask = np.zeros((size, size), dtype=np.uint8)
-        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
-        mask = cv2.GaussianBlur(mask, (31, 31), 12)
-        _paste_cache['soft_alpha'] = mask  # uint8 [0, 255] — blended via cv2 SIMD ops
-        _paste_cache['alpha_size'] = size
-    return _paste_cache['soft_alpha']
-
-# CUDA graph swap session cache
-_cuda_graph_session = {
-    'session': None,
-    'io_binding': None,
-    'ort_input': None,
-    'ort_latent': None,
-    'recorded': False,
-}
-# Serializes CUDA-graph replay. The io_binding + ort_input/ort_latent are
-# shared across threads and run_with_iobinding mutates GPU-side buffers;
-# concurrent calls would produce wrong output.
-_cuda_graph_lock = threading.Lock()
-
-
-class _CudaGraphSessionAdapter:
-    """Drop-in wrapper around an ONNX Runtime session.
-
-    Routes ``.run()`` through CUDA graph replay when a recorded graph is
-    available, and transparently proxies every other attribute to the
-    underlying session so insightface's INSwapper sees an unchanged API.
-    """
-
-    def __init__(self, underlying):
-        # Use object.__setattr__ to bypass our own __setattr__.
-        object.__setattr__(self, "_underlying", underlying)
-
-    def run(self, output_names, input_dict, **kwargs):
-        if _cuda_graph_session['recorded']:
-            try:
-                keys = list(input_dict.keys())
-                blob = input_dict[keys[0]]
-                latent = input_dict[keys[1]]
-                return [_cuda_graph_swap_inference(blob, latent)]
-            except Exception:
-                pass
-        return self._underlying.run(output_names, input_dict, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._underlying, name)
-
-    def __setattr__(self, name, value):
-        setattr(self._underlying, name, value)
-
-
-def _init_cuda_graph_session(model_path: str, swapper):
-    """Create a CUDA-graph-enabled ONNX session for the swap model.
-
-    CUDA graphs record the GPU kernel launch sequence once, then replay it
-    with near-zero CPU overhead on subsequent runs.  Requires static input
-    shapes (inswapper is always 1x3x128x128 + 1x512).
-    """
-    import onnxruntime as ort
-    try:
-        providers = [('CUDAExecutionProvider', {'enable_cuda_graph': '1'})]
-        sess = ort.InferenceSession(model_path, providers=providers)
-
-        # Pre-allocate GPU buffers with correct shapes
-        inp_shape = (1, 3, swapper.input_size[1], swapper.input_size[0])
-        latent_shape = (1, 512)
-        dummy_inp = np.zeros(inp_shape, dtype=np.float32)
-        dummy_lat = np.zeros(latent_shape, dtype=np.float32)
-
-        ort_input = ort.OrtValue.ortvalue_from_numpy(dummy_inp, 'cuda', 0)
-        ort_latent = ort.OrtValue.ortvalue_from_numpy(dummy_lat, 'cuda', 0)
-
-        io = sess.io_binding()
-        io.bind_ortvalue_input(swapper.input_names[0], ort_input)
-        io.bind_ortvalue_input(swapper.input_names[1], ort_latent)
-        io.bind_output(swapper.output_names[0], 'cuda', 0)
-
-        # First run records the CUDA graph
-        sess.run_with_iobinding(io)
-
-        _cuda_graph_session['session'] = sess
-        _cuda_graph_session['io_binding'] = io
-        _cuda_graph_session['ort_input'] = ort_input
-        _cuda_graph_session['ort_latent'] = ort_latent
-        _cuda_graph_session['recorded'] = True
-
-        # Wrap swapper.session in an adapter instead of rebinding
-        # session.run. insightface's INSwapper.get() reads .run via the
-        # session attribute, so either works; the adapter survives any
-        # later attribute reads on the session and keeps the original
-        # session object untouched.
-        if not isinstance(swapper.session, _CudaGraphSessionAdapter):
-            swapper.session = _CudaGraphSessionAdapter(swapper.session)
-
-        import sys
-        print(f"[{NAME}] CUDA graph session initialized (swap model)")
-        sys.stdout.flush()
-    except Exception as e:
-        print(f"[{NAME}] CUDA graph init failed, using standard session: {e}")
-        _cuda_graph_session['recorded'] = False
-
-
-def _cuda_graph_swap_inference(blob: np.ndarray, latent: np.ndarray) -> np.ndarray:
-    """Run swap model via CUDA graph replay — minimal CPU overhead."""
-    cg = _cuda_graph_session
-    with _cuda_graph_lock:
-        cg['ort_input'].update_inplace(blob)
-        cg['ort_latent'].update_inplace(latent)
-        cg['session'].run_with_iobinding(cg['io_binding'])
-        return cg['io_binding'].get_outputs()[0].numpy()
-
-
-def _fast_paste_back(target_img: Frame, bgr_fake: np.ndarray, aimg: np.ndarray, M: np.ndarray) -> Frame:
-    """Paste bgr_fake back onto target_img via the inverse affine of M.
-
-    Restricts work to the face bbox in output coordinates and warps a
-    precomputed feathered alpha template per-frame instead of running a
-    size-scaled erode+blur on the warped mask. Cost is O(crop_area) regardless
-    of how much of the frame the face occupies.
-    """
-    h, w = target_img.shape[:2]
-    face_h, face_w = aimg.shape[:2]
-    # inswapper's aligned-face space is square (128x128). _get_soft_alpha
-    # caches a single NxN template keyed by N, so fail loudly if that ever
-    # stops being true rather than silently mis-warping the alpha mask.
-    assert face_h == face_w, f"Expected square aligned face, got {face_h}x{face_w}"
-    IM = cv2.invertAffineTransform(M)
-
-    # Bbox in output coords from the affine corners of the aligned-face square.
-    corners = np.array(
-        [[0, 0], [face_w, 0], [face_w, face_h], [0, face_h]], dtype=np.float32
-    )
-    transformed = (IM[:, :2] @ corners.T).T + IM[:, 2]
-    x1 = int(np.floor(transformed[:, 0].min()))
-    x2 = int(np.ceil(transformed[:, 0].max()))
-    y1 = int(np.floor(transformed[:, 1].min()))
-    y2 = int(np.ceil(transformed[:, 1].max()))
-    if x1 >= x2 or y1 >= y2:
-        return target_img
-
-    # Small interpolation margin only — the feather is baked into the template.
-    pad = 2
-    y1p, y2p = max(0, y1 - pad), min(h, y2 + pad + 1)
-    x1p, x2p = max(0, x1 - pad), min(w, x2 + pad + 1)
-
-    IM_crop = IM.copy()
-    IM_crop[0, 2] -= x1p
-    IM_crop[1, 2] -= y1p
-    crop_w, crop_h = x2p - x1p, y2p - y1p
-
-    soft_alpha = _get_soft_alpha(face_h)
-    bgr_fake_crop = cv2.warpAffine(bgr_fake, IM_crop, (crop_w, crop_h), borderMode=cv2.BORDER_REPLICATE)
-    alpha_crop = cv2.warpAffine(soft_alpha, IM_crop, (crop_w, crop_h), borderValue=0)
-
-    target_crop = target_img[y1p:y2p, x1p:x2p]
-
-    if _HAS_TORCH_CUDA:
-        # Scale alpha to [0, 1] on device — cheaper to upload uint8 than float.
-        mask_t = torch.from_numpy(alpha_crop).cuda().float().mul_(1.0 / 255.0).unsqueeze(2)
-        fake_t = torch.from_numpy(bgr_fake_crop).float().cuda()
-        tgt_t = torch.from_numpy(target_crop).float().cuda()
-        blended = (mask_t * fake_t + (1.0 - mask_t) * tgt_t).to(torch.uint8).cpu().numpy()
-        target_img[y1p:y2p, x1p:x2p] = blended
-    else:
-        # Fused uint8 blend via cv2 SIMD — no float32 round-trip.
-        # Measured ~7-8× faster than the old numpy float32 path on a 1000×1000 crop.
-        alpha_3c = cv2.merge([alpha_crop, alpha_crop, alpha_crop])
-        inv_alpha = 255 - alpha_3c
-        a_fake = cv2.multiply(bgr_fake_crop, alpha_3c, scale=1.0 / 255.0)
-        a_tgt = cv2.multiply(target_crop, inv_alpha, scale=1.0 / 255.0)
-        target_img[y1p:y2p, x1p:x2p] = cv2.add(a_fake, a_tgt)
-
-    return target_img
 
 
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
@@ -512,149 +483,128 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if not hasattr(source_face, 'normed_embedding') or source_face.normed_embedding is None:
         return temp_frame
 
-    # _fast_paste_back writes in-place on the GPU path.  Only copy when
-    # mouth_mask or opacity < 1 need an unmodified original.
-    opacity = getattr(modules.globals, "opacity", 1.0)
-    opacity = max(0.0, min(1.0, opacity))
-    mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
-    poisson_blend_enabled = getattr(modules.globals, "poisson_blend", False)
-    # Poisson blend's seamlessClone needs the genuine pre-swap frame as its
-    # destination. Without this, original_frame aliases temp_frame, which
-    # _fast_paste_back mutates in place — so seamlessClone would blend the
-    # swapped face onto the already-swapped frame (no visible effect).
-    needs_original = opacity < 1.0 or mouth_mask_enabled or poisson_blend_enabled
-    if needs_original:
-        original_frame = temp_frame.copy()
-    else:
-        original_frame = temp_frame
-
+    # Pre-swap Input Check with optimization
     if temp_frame.dtype != np.uint8:
         temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
 
+    poisson_blend = getattr(modules.globals, "poisson_blend", False)
+    opacity = getattr(modules.globals, "opacity", 1.0)
+    opacity = max(0.0, min(1.0, opacity))
+
+    # Lazily copy the original frame only if blending is required
+    original_frame = None
+    if poisson_blend or opacity < 1.0:
+        original_frame = temp_frame.copy()
+
+    # Apply the face swap with optimized memory handling
     try:
+        # Ensure contiguous memory layout for better performance on all platforms
         if not temp_frame.flags['C_CONTIGUOUS']:
             temp_frame = np.ascontiguousarray(temp_frame)
+        
+        swapped_frame_raw = face_swapper.get(
+            temp_frame, target_face, source_face, paste_back=True
+        )
 
-        # Use paste_back=False and our optimized paste-back
-        if any("DmlExecutionProvider" in p for p in modules.globals.execution_providers):
-            with modules.globals.dml_lock:
-                bgr_fake, M = face_swapper.get(
-                    temp_frame, target_face, source_face, paste_back=False
-                )
-        else:
-            bgr_fake, M = face_swapper.get(
-                temp_frame, target_face, source_face, paste_back=False
-            )
+        # --- START: CRITICAL FIX FOR ORT 1.17 ---
+        # Check the output type and range from the model
+        if swapped_frame_raw is None:
+             # print("Warning: face_swapper.get returned None.") # Debug
+             return original_frame if original_frame is not None else temp_frame
 
-        if bgr_fake is None:
-            return original_frame
+        # Ensure the output is a numpy array
+        if not isinstance(swapped_frame_raw, np.ndarray):
+            # print(f"Warning: face_swapper.get returned type {type(swapped_frame_raw)}, expected numpy array.") # Debug
+            return original_frame if original_frame is not None else temp_frame
 
-        if not isinstance(bgr_fake, np.ndarray):
-            return original_frame
+        # Ensure the output has the correct shape (like the input frame)
+        if swapped_frame_raw.shape != temp_frame.shape:
+             # print(f"Warning: Swapped frame shape {swapped_frame_raw.shape} differs from input {temp_frame.shape}.") # Debug
+             # Attempt resize (might distort if aspect ratio changed, but better than crashing)
+             try:
+                 swapped_frame_raw = gpu_resize(swapped_frame_raw, (temp_frame.shape[1], temp_frame.shape[0]))
+             except Exception as resize_e:
+                 # print(f"Error resizing swapped frame: {resize_e}") # Debug
+                 return original_frame if original_frame is not None else temp_frame
 
-        # Pass a dummy aimg with correct shape — _fast_paste_back only uses aimg.shape
-        # to create the white mask. Avoids redundant norm_crop2 (~0.6ms).
-        _face_size = face_swapper.input_size[0]
-        _aimg_dummy = np.empty((_face_size, _face_size, 3), dtype=np.uint8)
-
-        swapped_frame = _fast_paste_back(temp_frame, bgr_fake, _aimg_dummy, M)
+        # Explicitly clip values to 0-255 and convert to uint8
+        # This handles cases where the model might output floats or values outside the valid range
+        swapped_frame = np.clip(swapped_frame_raw, 0, 255).astype(np.uint8)
+        # --- END: CRITICAL FIX FOR ORT 1.17 ---
 
     except Exception as e:
-        print(f"Error during face swap: {e}")
-        return original_frame
+        print(f"Error during face swap using face_swapper.get: {e}") # More specific error
+        # import traceback
+        # traceback.print_exc() # Print full traceback for debugging
+        return original_frame if original_frame is not None else temp_frame
 
     # --- Post-swap Processing (Masking, Opacity, etc.) ---
     # Now, work with the guaranteed uint8 'swapped_frame'
 
-    if mouth_mask_enabled: # Check if mouth_mask is enabled
+    if getattr(modules.globals, "mouth_mask", False): # Check if mouth_mask is enabled
         # Create a mask for the target face
-        face_mask = create_face_mask(target_face, original_frame) # Use original_frame for mask creation geometry
+        face_mask = create_face_mask(target_face, temp_frame) # Use temp_frame (original shape) for mask creation geometry
 
-        # Create the mouth mask using the ORIGINAL frame (before swap) for cutout
+        # Create the mouth mask using original geometry
         mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = (
-            create_lower_mouth_mask(target_face, original_frame) # Use original_frame for real mouth cutout
+            create_lower_mouth_mask(target_face, temp_frame) # Use temp_frame (original) for cutout
         )
 
         # Apply the mouth area only if mouth_cutout exists
-        if mouth_cutout is not None and mouth_box != (0,0,0,0):
-            # Apply mouth area (from original) onto the 'swapped_frame'
+        if mouth_cutout is not None and mouth_box != (0,0,0,0): # Add check for valid box
+             # Apply mouth area (from original) onto the 'swapped_frame'
             swapped_frame = apply_mouth_area(
                 swapped_frame, mouth_cutout, mouth_box, face_mask, lower_lip_polygon
             )
 
-            # Draw bounding box only while slider is being dragged
             if getattr(modules.globals, "show_mouth_mask_box", False):
-                mouth_mask_data = (mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon)
-                swapped_frame = draw_mouth_mask_visualization(
-                    swapped_frame, target_face, mouth_mask_data
-                )
+                        mouth_mask_data = (mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon)
+                        # Draw visualization on the swapped_frame *before* opacity blending
+                        swapped_frame = draw_mouth_mask_visualization(
+                            swapped_frame, target_face, mouth_mask_data
+                        )
         
     # --- Poisson Blending ---
-    # Mask derived from the swap's own affine (M) + swapped pixels (bgr_fake),
-    # so it tracks the swapped face exactly per-frame — no landmark jitter,
-    # no EMA, no lag. See _apply_poisson_blend.
     if getattr(modules.globals, "poisson_blend", False):
-        swapped_frame = _apply_poisson_blend(
-            swapped_frame, original_frame, target_face, M, bgr_fake
-        )
+        face_mask = create_face_mask(target_face, temp_frame)
+        if face_mask is not None:
+            # Find bounding box of the mask
+            y_indices, x_indices = np.where(face_mask > 0)
+            if len(x_indices) > 0 and len(y_indices) > 0:
+                x_min, x_max = np.min(x_indices), np.max(x_indices)
+                y_min, y_max = np.min(y_indices), np.max(y_indices)
 
-    # Apply opacity blend between the original frame and the swapped frame
-    if opacity >= 1.0:
-        return swapped_frame.astype(np.uint8)
+                # Calculate center
+                center = (int((x_min + x_max) / 2), int((y_min + y_max) / 2))
 
-    # Blend the original_frame with the (potentially mouth-masked) swapped_frame
-    final_swapped_frame = gpu_add_weighted(original_frame.astype(np.uint8), 1 - opacity, swapped_frame.astype(np.uint8), opacity, 0)
-    return final_swapped_frame.astype(np.uint8)
+                # Crop src and mask
+                src_crop = swapped_frame[y_min : y_max + 1, x_min : x_max + 1]
+                mask_crop = face_mask[y_min : y_max + 1, x_min : x_max + 1]
 
+                try:
+                    # Use original_frame as destination to blend the swapped face onto it
+                    swapped_frame = cv2.seamlessClone(
+                        src_crop,
+                        original_frame,
+                        mask_crop,
+                        center,
+                        cv2.NORMAL_CLONE,
+                    )
+                except Exception as e:
+                    print(f"Poisson blending failed: {e}")
+        
+    # Apply opacity blend if we have the original frame
+    if original_frame is not None:
+        final_swapped_frame = gpu_add_weighted(original_frame, 1 - opacity, swapped_frame, opacity, 0)
+        return final_swapped_frame.astype(np.uint8)
 
-# --- START: Mac M1-M5 Optimized Face Detection ---
-def get_faces_optimized(frame: Frame, use_cache: bool = True) -> Optional[List[Face]]:
-    """Optimized face detection for live mode on Apple Silicon"""
-    global LAST_DETECTION_TIME, FACE_DETECTION_CACHE
-    
-    if not use_cache or not IS_APPLE_SILICON:
-        # Standard detection
-        if modules.globals.many_faces:
-            return get_many_faces(frame)
-        else:
-            face = get_one_face(frame)
-            return [face] if face else None
-    
-    # Adaptive detection rate for live mode
-    current_time = time.time()
-    time_since_last = current_time - LAST_DETECTION_TIME
-    
-    # Skip detection if too soon (adaptive frame skipping)
-    if time_since_last < DETECTION_INTERVAL and FACE_DETECTION_CACHE:
-        return FACE_DETECTION_CACHE.get('faces')
-    
-    # Perform detection
-    LAST_DETECTION_TIME = current_time
-    if modules.globals.many_faces:
-        faces = get_many_faces(frame)
-    else:
-        face = get_one_face(frame)
-        faces = [face] if face else None
-    
-    # Cache results
-    FACE_DETECTION_CACHE['faces'] = faces
-    FACE_DETECTION_CACHE['timestamp'] = current_time
-    
-    return faces
-# --- END: Mac M1-M5 Optimized Face Detection ---
+    return swapped_frame
+
 
 # --- START: Helper function for interpolation and sharpening ---
 def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.ndarray]) -> Frame:
     """Applies sharpening and interpolation with Apple Silicon optimizations."""
     global PREVIOUS_FRAME_RESULT
-
-    sharpness_value = getattr(modules.globals, "sharpness", 0.0)
-    enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
-
-    # Skip copy when no post-processing is active
-    if sharpness_value <= 0.0 and not enable_interpolation:
-        PREVIOUS_FRAME_RESULT = None
-        return current_frame
 
     processed_frame = current_frame.copy()
 
@@ -681,8 +631,7 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
                 continue
 
             face_region = processed_frame[y1:y2, x1:x2]
-            if face_region.size == 0:
-                continue
+            if face_region.size == 0: continue
 
             # Apply sharpening (GPU-accelerated when CUDA OpenCV is available)
             try:
@@ -724,22 +673,19 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
                 pass
             PREVIOUS_FRAME_RESULT = processed_frame.copy()
     else:
-         # Interpolation is off or weight is invalid — no need to cache
-         PREVIOUS_FRAME_RESULT = None
+         # If interpolation is off or weight is invalid, just use the current frame
+         # Update state with the current (potentially sharpened) frame
+         # Reset previous frame state if interpolation was just turned off or weight is invalid
+         PREVIOUS_FRAME_RESULT = processed_frame.copy()
 
 
     return final_frame
 # --- END: Helper function for interpolation and sharpening ---
 
 
-def process_frame(source_face: Face, temp_frame: Frame, target_face: Face = None) -> Frame:
-    """Process a single frame, swapping source_face onto detected target(s).
 
-    Args:
-        target_face: Pre-detected target face. When provided, skips the
-            internal face detection call (saves ~30-40ms per frame).
-            Ignored when many_faces mode is active.
-    """
+def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
+    """Processes a single frame using one source face."""
     if getattr(modules.globals, "opacity", 1.0) == 0:
         global PREVIOUS_FRAME_RESULT
         PREVIOUS_FRAME_RESULT = None
@@ -748,24 +694,39 @@ def process_frame(source_face: Face, temp_frame: Frame, target_face: Face = None
     processed_frame = temp_frame
     swapped_face_bboxes = []
 
-    if modules.globals.many_faces:
-        many_faces = get_many_faces(processed_frame)
-        if many_faces:
-            current_swap_target = processed_frame.copy()
-            for face in many_faces:
-                current_swap_target = swap_face(source_face, face, current_swap_target)
-                if face is not None and hasattr(face, "bbox") and face.bbox is not None:
-                    swapped_face_bboxes.append(face.bbox.astype(int))
-            processed_frame = current_swap_target
+    is_file_target = modules.globals.target_path and (is_image(modules.globals.target_path) or is_video(modules.globals.target_path))
+
+    if is_file_target:
+        detected_faces = get_many_faces(processed_frame)
     else:
-        if target_face is None:
-            target_face = get_one_face(processed_frame)
-        if target_face:
+        global _LIVE_DETECTION_COUNTER, _LIVE_LAST_FACES, LIVE_TRACKER
+        if LIVE_TRACKER is None:
+            LIVE_TRACKER = FaceTracker()
+        _LIVE_DETECTION_COUNTER += 1
+        if _LIVE_DETECTION_COUNTER >= LIVE_DETECTION_INTERVAL or not _LIVE_LAST_FACES:
+            _LIVE_DETECTION_COUNTER = 0
+            raw_faces = get_many_faces(processed_frame) or []
+            _LIVE_LAST_FACES = LIVE_TRACKER.update(processed_frame, raw_faces)
+        else:
+            _LIVE_LAST_FACES = LIVE_TRACKER.update(processed_frame)
+        detected_faces = _LIVE_LAST_FACES
+
+    if detected_faces:
+        if modules.globals.many_faces:
+            current_swap_target = processed_frame.copy()
+            for target_face in detected_faces:
+                current_swap_target = swap_face(source_face, target_face, current_swap_target)
+                if target_face is not None and hasattr(target_face, "bbox") and target_face.bbox is not None:
+                    swapped_face_bboxes.append(target_face.bbox.astype(int))
+            processed_frame = current_swap_target
+        else:
+            target_face = detected_faces[0]
             processed_frame = swap_face(source_face, target_face, processed_frame)
-            if hasattr(target_face, "bbox") and target_face.bbox is not None:
-                swapped_face_bboxes.append(target_face.bbox.astype(int))
+            if target_face is not None and hasattr(target_face, "bbox") and target_face.bbox is not None:
+                    swapped_face_bboxes.append(target_face.bbox.astype(int))
 
     final_frame = apply_post_processing(processed_frame, swapped_face_bboxes)
+
     return final_frame
 
 
@@ -817,11 +778,9 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
             else: # Single face or specific mapping
                  for map_data in source_target_map:
                     source_info = map_data.get("source", {})
-                    if not source_info:
-                        continue # Skip if no source info
+                    if not source_info: continue # Skip if no source info
                     source_face = source_info.get("face")
-                    if not source_face:
-                        continue # Skip if no source defined for this map entry
+                    if not source_face: continue # Skip if no source defined for this map entry
 
                     if is_image(modules.globals.target_path):
                         target_info = map_data.get("target", {})
@@ -840,8 +799,17 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                                       source_target_pairs.append((source_face, target_face))
 
     else:
-        # Live stream or webcam processing (analyze faces on the fly)
-        detected_faces = get_many_faces(processed_frame)
+        global _LIVE_DETECTION_COUNTER, _LIVE_LAST_FACES, LIVE_TRACKER
+        if LIVE_TRACKER is None:
+            LIVE_TRACKER = FaceTracker()
+        _LIVE_DETECTION_COUNTER += 1
+        if _LIVE_DETECTION_COUNTER >= LIVE_DETECTION_INTERVAL or not _LIVE_LAST_FACES:
+            _LIVE_DETECTION_COUNTER = 0
+            raw_faces = get_many_faces(processed_frame) or []
+            _LIVE_LAST_FACES = LIVE_TRACKER.update(processed_frame, raw_faces)
+        else:
+            _LIVE_LAST_FACES = LIVE_TRACKER.update(processed_frame)
+        detected_faces = _LIVE_LAST_FACES
         if detected_faces:
             if modules.globals.many_faces:
                  source_face = default_source_face() # Use default source for all detected targets
@@ -858,8 +826,7 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                      if len(detected_faces) <= len(target_embeddings):
                           # More targets defined than detected - match each detected face
                           for detected_face in detected_faces:
-                              if detected_face.normed_embedding is None:
-                                  continue
+                              if detected_face.normed_embedding is None: continue
                               closest_idx, _ = find_closest_centroid(target_embeddings, detected_face.normed_embedding)
                               if 0 <= closest_idx < len(source_faces):
                                   source_target_pairs.append((source_faces[closest_idx], detected_face))
@@ -867,8 +834,7 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                           # More faces detected than targets defined - match each target embedding to closest detected face
                           detected_embeddings = [f.normed_embedding for f in detected_faces if f.normed_embedding is not None]
                           detected_faces_with_embedding = [f for f in detected_faces if f.normed_embedding is not None]
-                          if not detected_embeddings:
-                              return processed_frame # No embeddings to match
+                          if not detected_embeddings: return processed_frame # No embeddings to match
 
                           for i, target_embedding in enumerate(target_embeddings):
                               if 0 <= i < len(source_faces): # Ensure source face exists for this embedding
@@ -918,7 +884,7 @@ def process_frames(
             # Log the error but allow proceeding; subsequent check will stop processing.
         else:
             try:
-                source_img = imread_unicode(source_path)
+                source_img = cv2.imread(source_path)
                 if source_img is None:
                     # Specific error for file reading failure
                     update_status(f"Error reading source image file {source_path}. Please check the path and file integrity.", NAME)
@@ -942,7 +908,7 @@ def process_frames(
 
     # --- Stop processing entirely if in Simple Mode and source face is invalid ---
     if not use_v2 and source_face is None:
-        update_status("Halting video processing: Invalid or no face detected in source image for simple mode.", NAME)
+        update_status(f"Halting video processing: Invalid or no face detected in source image for simple mode.", NAME)
         if progress:
             # Ensure the progress bar completes if it was started
             remaining_updates = total_frames - progress.n if hasattr(progress, 'n') else total_frames
@@ -958,16 +924,14 @@ def process_frames(
         # Read the target frame
         temp_frame = None
         try:
-            temp_frame = imread_unicode(temp_frame_path)
+            temp_frame = cv2.imread(temp_frame_path)
             if temp_frame is None:
                 print(f"{NAME}: Error: Could not read frame: {temp_frame_path}, skipping.")
-                if progress:
-                    progress.update(1)
+                if progress: progress.update(1)
                 continue # Skip this frame if read fails
         except Exception as read_e:
             print(f"{NAME}: Error reading frame {temp_frame_path}: {read_e}, skipping.")
-            if progress:
-                progress.update(1)
+            if progress: progress.update(1)
             continue
 
         # Select processing function and execute
@@ -980,7 +944,7 @@ def process_frames(
             else:
                 # Simple mode uses the pre-loaded source_face (already checked for validity above)
                 # update_status(f"Using process_frame (simple) for: {os.path.basename(temp_frame_path)}", NAME) # Optional Debug
-                result_frame = process_frame(source_face, temp_frame) # source_face is guaranteed to be valid here
+                result_frame = process_frame(source_face, temp_frame)
 
             # Check if processing actually returned a frame
             if result_frame is None:
@@ -996,7 +960,7 @@ def process_frames(
         # Write the result back to the same frame path with optimized compression
         try:
             # Use PNG compression level 3 (faster) instead of default 9
-            write_success = imwrite_unicode(temp_frame_path, result_frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            write_success = cv2.imwrite(temp_frame_path, result_frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
             if not write_success:
                 print(f"{NAME}: Error: Failed to write processed frame to {temp_frame_path}")
         except Exception as write_e:
@@ -1026,7 +990,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
     # Read target first
     try:
-        target_frame = imread_unicode(target_path)
+        target_frame = cv2.imread(target_path)
         if target_frame is None:
             update_status(f"Error: Could not read target image: {target_path}", NAME)
             return
@@ -1045,7 +1009,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
         else: # Simple mode
             try:
-                source_img = imread_unicode(source_path)
+                source_img = cv2.imread(source_path)
                 if source_img is None:
                     update_status(f"Error: Could not read source image: {source_path}", NAME)
                     return
@@ -1061,7 +1025,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
         # Write the result if processing was successful
         if result is not None:
-            write_success = imwrite_unicode(output_path, result)
+            write_success = cv2.imwrite(output_path, result)
             if write_success:
                 update_status(f"Output image saved to: {output_path}", NAME)
             else:
@@ -1079,19 +1043,16 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 def process_video(source_path: str, temp_frame_paths: List[str]) -> None:
     """Sets up and calls the frame processing for video."""
     # --- Reset interpolation state before starting video processing ---
-    global PREVIOUS_FRAME_RESULT
+    global PREVIOUS_FRAME_RESULT, _LIVE_DETECTION_COUNTER, _LIVE_LAST_FACES
     PREVIOUS_FRAME_RESULT = None
-    # ---
+    _LIVE_DETECTION_COUNTER = 0
+    _LIVE_LAST_FACES = []
 
     mode_desc = "'map_faces'" if getattr(modules.globals, "map_faces", False) else "'simple'"
-    if getattr(modules.globals, "map_faces", False) and getattr(modules.globals, "many_faces", False):
-        mode_desc += " and 'many_faces'. Using pre-analysis map."
     update_status(f"Processing video with {mode_desc} mode.", NAME)
 
-    # Pass the correct source_path (needed for simple mode in process_frames)
-    # The core processing logic handles calling the right frame function (process_frames)
     modules.processors.frame.core.process_video(
-        source_path, temp_frame_paths, process_frames # Pass the newly modified process_frames
+        source_path, temp_frame_paths, process_frames
     )
 
 # ==========================
@@ -1119,20 +1080,13 @@ def create_lower_mouth_mask(
         return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
     try: # Wrap main logic in try-except
-        # Outer mouth/lip landmarks (52-63) — the lip outline only. In this
-        # repo's insightface 2d106 convention these 12 points, taken in index
-        # order, form a SIMPLE (non-self-intersecting) closed polygon that
-        # cv2.fillPoly fills as one solid region directly over the mouth.
-        # This is the last shipped, known-good landmark set; range(52,72)
-        # (the regression) added the inner-lip points and made the path
-        # self-intersect, and the ancient [65,66,62,...,0,8,7...] indices
-        # belong to a different/older landmark convention (they land on the
-        # inner lip + random jaw points, so the mask never covers the mouth).
+        # Use outer mouth landmarks (52-63) to capture the lips only
+        # This avoids including the chin/jawline, preserving the face shape from the swap
         lower_lip_order = list(range(52, 64))
 
-        # All indices must be valid for the loaded landmark set
+        # Check if all indices are valid for the loaded landmarks (already partially done by < 106 check)
         if max(lower_lip_order) >= landmarks.shape[0]:
-            # print(f"Warning: Landmark index out of bounds for shape {landmarks.shape[0]}.")
+            # print(f"Warning: Landmark index {max(lower_lip_order)} out of bounds for shape {landmarks.shape[0]}.")
             return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
         lower_lip_landmarks = landmarks[lower_lip_order].astype(np.float32)
@@ -1147,25 +1101,10 @@ def create_lower_mouth_mask(
             # print("Warning: Could not calculate valid center for mouth mask.")
             return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
-        # Drive expansion from the Mouth Mask slider so it actually responds.
-        # The known-good version expanded by the now-unused mask_down_size
-        # constant, which is why the slider had no effect.
-        # s: 0.0 (slider ~0, tight lip outline) -> 1.0 (slider 100, mouth->chin).
-        mouth_mask_size = getattr(modules.globals, "mouth_mask_size", 0.0) # 0-100 slider
-        s = max(0.0, min(1.0, mouth_mask_size / 100.0))
 
-        # Uniformly scaling a simple polygon about its centroid keeps it simple
-        # (no self-intersection). x grows with expansion_factor; points below
-        # centre (toward the chin) also get an extra downward stretch so high
-        # slider values reach from the mouth down to the chin.
-        expansion_factor = 1.0 + s * 2.0          # 1.0x -> 3.0x
-        chin_bias = 1.0 + s * 2.0                  # extra downward stretch
-        offsets = lower_lip_landmarks - center
-        scale_y = np.where(offsets[:, 1] > 0,
-                           expansion_factor * chin_bias, expansion_factor)
-        expanded_landmarks = lower_lip_landmarks.copy()
-        expanded_landmarks[:, 0] = center[0] + offsets[:, 0] * expansion_factor
-        expanded_landmarks[:, 1] = center[1] + offsets[:, 1] * scale_y
+        mask_down_size = getattr(modules.globals, "mask_down_size", 0.1) # Default 0.1
+        expansion_factor = 1 + mask_down_size
+        expanded_landmarks = (lower_lip_landmarks - center) * expansion_factor + center
 
         # Ensure landmarks are finite after adjustments
         if not np.all(np.isfinite(expanded_landmarks)):
@@ -1272,8 +1211,8 @@ def draw_mouth_mask_visualization(
         print(f"Error drawing polygon for visualization: {e}") # Optional debug
         pass
 
-    # Draw bounding box (red rectangle)
-    cv2.rectangle(vis_frame, (min_x, min_y), (max_x, max_y), (0, 0, 255), 2)
+    # Optional: Draw bounding box (red rectangle)
+    # cv2.rectangle(vis_frame, (min_x, min_y), (max_x, max_y), (0, 0, 255), 1)
 
     # Optional: Add labels
     label_pos_y = min_y - 10 if min_y > 20 else max_y + 15 # Adjust position based on box location
@@ -1353,34 +1292,85 @@ def apply_mouth_area(
             # print("Warning: Mouth cutout is invalid after resize attempt.")
             return frame
 
+        # --- Color Correction Step ---
+        # Apply color transfer from ROI (swapped face region) to the original mouth cutout
+        # This helps match lighting/color before blending
+        color_corrected_mouth = resized_mouth_cutout # Default to resized if correction fails
+        try:
+           # Ensure both images are 3 channels for color transfer
+           if len(resized_mouth_cutout.shape) == 3 and resized_mouth_cutout.shape[2] == 3 and \
+              len(roi.shape) == 3 and roi.shape[2] == 3:
+                 color_corrected_mouth = apply_color_transfer(resized_mouth_cutout, roi)
+           else:
+               # print("Warning: Cannot apply color transfer, images not BGR.")
+               pass
+        except cv2.error as ct_e: # Handle potential errors in color transfer
+           # print(f"Warning: Color transfer failed: {ct_e}. Using uncorrected mouth cutout.") # Optional debug
+           pass
+        except Exception as ct_gen_e:
+           # print(f"Warning: Unexpected error during color transfer: {ct_gen_e}")
+           pass
+        # --- End Color Correction ---
+
+
         # --- Mask Creation ---
-        # Create a mask based on the mouth_polygon, relative to the ROI
+        # Create a mask based *specifically* on the mouth_polygon, relative to the ROI
         polygon_mask_roi = np.zeros(roi.shape[:2], dtype=np.uint8)
+        # Adjust polygon coordinates relative to the ROI's top-left corner
         adjusted_polygon = mouth_polygon - [min_x, min_y]
+        # Draw the filled polygon on the ROI mask
         cv2.fillPoly(polygon_mask_roi, [adjusted_polygon.astype(np.int32)], 255)
 
-        # Feather the edges with Gaussian blur for smooth blending
-        feather_amount = max(1, min(30, min(box_width, box_height) // 8))
+        # Feather the polygon mask (Gaussian blur)
+        mask_feather_ratio = getattr(modules.globals, "mask_feather_ratio", 12) # Default 12
+        # Calculate feather amount based on the smaller dimension of the box
+        feather_base_dim = min(box_width, box_height)
+        feather_amount = max(1, min(30, feather_base_dim // max(1, mask_feather_ratio))) # Avoid div by zero
+        # Ensure kernel size is odd and positive
         kernel_size = 2 * feather_amount + 1
-        feathered_mask = cv2.GaussianBlur(polygon_mask_roi.astype(np.float32), (kernel_size, kernel_size), 0)
+        feathered_polygon_mask = cv2.GaussianBlur(polygon_mask_roi.astype(float), (kernel_size, kernel_size), 0)
 
-        # Normalize to [0.0, 1.0]
-        max_val = feathered_mask.max()
-        if max_val > 1e-6:
-            feathered_mask = feathered_mask / max_val
+        # Normalize feathered mask to [0.0, 1.0] range
+        max_val = feathered_polygon_mask.max()
+        if max_val > 1e-6: # Avoid division by zero
+           feathered_polygon_mask = feathered_polygon_mask / max_val
         else:
-            feathered_mask.fill(0.0)
+           feathered_polygon_mask.fill(0.0) # Mask is all black if max is near zero
+        # --- End Mask Creation ---
 
-        # --- Blending: paste original mouth onto swapped face ---
+
+        # --- Refined Blending ---
+        # Get the corresponding ROI from the *full face mask* (already blurred)
+        # Ensure face_mask is float and normalized [0.0, 1.0]
+        if face_mask.dtype != np.float64 and face_mask.dtype != np.float32:
+            face_mask_float = face_mask.astype(float) / 255.0
+        else: # Assume already float [0,1] if type is float
+            face_mask_float = face_mask
+        face_mask_roi = face_mask_float[min_y:max_y, min_x:max_x]
+
+        # Combine the feathered mouth polygon mask with the face mask ROI
+        # Use minimum to ensure we only affect area inside both masks (mouth area within face)
+        # This helps blend the edges smoothly with the surrounding swapped face region
+        combined_mask = np.minimum(feathered_polygon_mask, face_mask_roi)
+
+        # Expand mask to 3 channels for blending (ensure it matches image channels)
         if len(frame.shape) == 3 and frame.shape[2] == 3:
-            mask_3ch = feathered_mask[:, :, np.newaxis].astype(np.float32)
-            inv_mask = 1.0 - mask_3ch
+            combined_mask_3channel = combined_mask[:, :, np.newaxis]
 
-            # Blend: (original_mouth * mask) + (swapped_face * (1 - mask))
-            blended_roi = (resized_mouth_cutout.astype(np.float32) * mask_3ch +
-                           roi.astype(np.float32) * inv_mask)
+            # Ensure data types are compatible for blending (float or double for mask, uint8 for images)
+            color_corrected_mouth_uint8 = color_corrected_mouth.astype(np.uint8)
+            roi_uint8 = roi.astype(np.uint8)
+            combined_mask_float = combined_mask_3channel.astype(np.float64) # Use float64 for precision in mask
 
-            frame[min_y:max_y, min_x:max_x] = np.clip(blended_roi, 0, 255).astype(np.uint8)
+            # Blend: (original_mouth * combined_mask) + (swapped_face_roi * (1 - combined_mask))
+            blended_roi = (color_corrected_mouth_uint8 * combined_mask_float +
+                           roi_uint8 * (1.0 - combined_mask_float))
+
+            # Place the blended ROI back into the frame
+            frame[min_y:max_y, min_x:max_x] = blended_roi.astype(np.uint8)
+        else:
+            # print("Warning: Cannot apply mouth mask blending, frame is not 3-channel BGR.")
+            pass # Don't modify frame if it's not BGR
 
     except Exception as e:
         print(f"Error applying mouth area: {e}") # Optional debug
@@ -1393,13 +1383,10 @@ def apply_mouth_area(
 
 def create_face_mask(face: Face, frame: Frame) -> np.ndarray:
     """Creates a feathered mask covering the whole face area based on landmarks."""
-    if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
-        return np.zeros((0, 0), dtype=np.uint8)
-
     mask = np.zeros(frame.shape[:2], dtype=np.uint8) # Start with uint8
 
     # Validate inputs
-    if face is None or not hasattr(face, 'landmark_2d_106'):
+    if face is None or not hasattr(face, 'landmark_2d_106') or frame is None:
         # print("Warning: Invalid face or frame for create_face_mask.")
         return mask # Return empty mask
 
@@ -1504,8 +1491,7 @@ def apply_color_transfer(source, target):
             if len(source.shape) == 2: # Grayscale
                 source = cv2.cvtColor(source, cv2.COLOR_GRAY2BGR)
             source = np.clip(source, 0, 255).astype(np.uint8)
-            if len(source.shape) != 3 or source.shape[2] != 3:
-                raise ValueError("Conversion failed")
+            if len(source.shape)!= 3 or source.shape[2]!= 3: raise ValueError("Conversion failed")
         except Exception:
             return source
     if len(target.shape) != 3 or target.shape[2] != 3 or target.dtype != np.uint8:
@@ -1514,8 +1500,7 @@ def apply_color_transfer(source, target):
             if len(target.shape) == 2: # Grayscale
                 target = cv2.cvtColor(target, cv2.COLOR_GRAY2BGR)
             target = np.clip(target, 0, 255).astype(np.uint8)
-            if len(target.shape) != 3 or target.shape[2] != 3:
-                raise ValueError("Conversion failed")
+            if len(target.shape)!= 3 or target.shape[2]!= 3: raise ValueError("Conversion failed")
         except Exception:
              return source # Return original source if target invalid
 

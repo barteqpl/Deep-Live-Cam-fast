@@ -41,6 +41,8 @@ live_resizable: bool = True
 camera_input_combobox: Any | None = None # Placeholder for UI element if needed
 webcam_preview_running: bool = False
 show_fps: bool = False
+stream_udp: str | None = None
+
 
 # System Configuration
 max_memory: int | None = None        # Memory limit in GB? (Needs clarification)
@@ -54,8 +56,9 @@ fp_ui: Dict[str, bool] = {"face_enhancer": False, "face_enhancer_gpen256": False
 
 # Face Swapper Specific Options
 face_swapper_enabled: bool = True # General toggle for the swapper processor
+swapper_model: str = "inswapper"  # Model choice: "inswapper", "hififace" or "simswap"
 opacity: float = 1.0              # Blend factor for the swapped face (0.0-1.0)
-sharpness: float = 0.0            # Sharpness enhancement for swapped face (0.0-1.0+)
+sharpness: float = 0.15            # Sharpness enhancement for swapped face (0.0-1.0+)
 
 # Mouth Mask Options
 mouth_mask: bool = False           # Enable mouth area masking/pasting

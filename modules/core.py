@@ -51,11 +51,13 @@ def parse_args() -> None:
     program.add_argument('--nsfw-filter', help='filter the NSFW image or video', dest='nsfw_filter', action='store_true', default=False)
     program.add_argument('--map-faces', help='map source target faces', dest='map_faces', action='store_true', default=False)
     program.add_argument('--mouth-mask', help='mask the mouth region', dest='mouth_mask', action='store_true', default=False)
+    program.add_argument('--swapper-model', help='select face swapper model', dest='swapper_model', default='inswapper', choices=['inswapper', 'hififace', 'simswap', 'hyperswap'])
     program.add_argument('--video-encoder', help='adjust output video encoder', dest='video_encoder', default='libx264', choices=['libx264', 'libx265', 'libvpx-vp9'])
     program.add_argument('--video-quality', help='adjust output video quality', dest='video_quality', type=int, default=18, choices=range(52), metavar='[0-51]')
     program.add_argument('-l', '--lang', help='Ui language', default="en")
     program.add_argument('--live-mirror', help='The live camera display as you see it in the front-facing camera frame', dest='live_mirror', action='store_true', default=False)
     program.add_argument('--live-resizable', help='The live camera frame is resizable', dest='live_resizable', action='store_true', default=False)
+    program.add_argument('--stream-udp', help='stream live output over UDP (e.g. 127.0.0.1:5000 or 5000)', dest='stream_udp')
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
     program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=[suggest_default_execution_provider()], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
@@ -79,12 +81,14 @@ def parse_args() -> None:
     modules.globals.keep_frames = args.keep_frames
     modules.globals.many_faces = args.many_faces
     modules.globals.mouth_mask = args.mouth_mask
+    modules.globals.swapper_model = args.swapper_model
     modules.globals.nsfw_filter = args.nsfw_filter
     modules.globals.map_faces = args.map_faces
     modules.globals.video_encoder = args.video_encoder
     modules.globals.video_quality = args.video_quality
     modules.globals.live_mirror = args.live_mirror
     modules.globals.live_resizable = args.live_resizable
+    modules.globals.stream_udp = args.stream_udp
     modules.globals.max_memory = args.max_memory
     modules.globals.execution_providers = decode_execution_providers(args.execution_provider)
     modules.globals.execution_threads = args.execution_threads
