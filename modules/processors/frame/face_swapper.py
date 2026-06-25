@@ -61,6 +61,25 @@ def _warp_face_by_template(img, kps, template_name, crop_size):
     return crop, M
 
 
+_MARGIN_MASK_CACHE = {}
+
+def get_margin_mask(size: int) -> np.ndarray:
+    """Pre-computes and caches boundary-fading masks to prevent rectangular edge artifacts."""
+    if size not in _MARGIN_MASK_CACHE:
+        mask = np.ones((size, size), dtype=np.float32)
+        margin = max(size // 16, 12)  # e.g., 16 pixels margin for 256 size
+        
+        # 1D ramp for linear fadeout
+        ramp = np.ones(size, dtype=np.float32)
+        ramp[:margin] = np.linspace(0.0, 1.0, margin, dtype=np.float32)
+        ramp[-margin:] = np.linspace(1.0, 0.0, margin, dtype=np.float32)
+        
+        # Multiply to create 2D mask
+        mask = mask * ramp.reshape(1, size) * ramp.reshape(size, 1)
+        _MARGIN_MASK_CACHE[size] = mask
+    return _MARGIN_MASK_CACHE[size]
+
+
 _CROP_MASK_CACHE = {}
 
 def get_crop_mask(size: int) -> np.ndarray:
@@ -77,6 +96,11 @@ def get_crop_mask(size: int) -> np.ndarray:
         if k_blur % 2 == 0:
             k_blur += 1
         mask = cv2.GaussianBlur(mask, (k_blur, k_blur), 0)
+        
+        # Apply margin mask to prevent any rectangular edges at the very borders
+        margin_mask = get_margin_mask(size)
+        mask = mask * margin_mask
+        
         _CROP_MASK_CACHE[size] = mask
     return _CROP_MASK_CACHE[size]
 
@@ -169,6 +193,9 @@ class HiFiFaceSwapper:
         eliptic = get_crop_mask(256) / 255.0
         combined_mask = np.maximum(mask_fake, eliptic)
         mask_fake = (1.0 - blend_weight) * mask_fake + blend_weight * combined_mask
+        
+        # Apply margin mask to prevent rectangular border bleeding
+        mask_fake = mask_fake * get_margin_mask(256)
 
         mask_warped = cv2.warpAffine(mask_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
         mask_warped = np.reshape(mask_warped, [mask_warped.shape[0], mask_warped.shape[1], 1])
@@ -297,6 +324,10 @@ class HyperSwapSwapper:
         eliptic = get_crop_mask(256) / 255.0
         combined_mask = np.maximum(crop_mask, eliptic)
         crop_mask = (1.0 - blend_weight) * crop_mask + blend_weight * combined_mask
+        
+        # Apply margin mask to prevent rectangular border bleeding
+        crop_mask = crop_mask * get_margin_mask(256)
+
         full_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
         # Slight blur for smoother blending
         full_mask = cv2.GaussianBlur(full_mask, (5, 5), 0)
