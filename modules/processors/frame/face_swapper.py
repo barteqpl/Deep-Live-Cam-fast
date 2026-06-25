@@ -135,7 +135,10 @@ def apply_chin_blend_to_mask(crop_mask: np.ndarray, size: int) -> np.ndarray:
         # Map chin_weight [0.5 -> 1.0] to expansion factor t [0.0 -> 1.0]
         t = (chin_weight - 0.5) / 0.5
         
-        blend_weight = np.clip((y_indices - 100) / 40.0, 0.0, 1.0).astype(np.float32)
+        # Scale blend transition relative to crop size (start at ~39%, transition over ~16%)
+        y_start_px = int(size * 0.39)
+        y_range_px = max(int(size * 0.16), 1)
+        blend_weight = np.clip((y_indices - y_start_px) / float(y_range_px), 0.0, 1.0).astype(np.float32)
         
         # Normalise custom ellipse mask
         eliptic = get_crop_mask(size) / 255.0

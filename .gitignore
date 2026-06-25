@@ -29,3 +29,7 @@ switch_states.json
 install.bat
 /.claude
 *.bat
+.DS_Store
+.insightface/
+*.pth
+HANDOFF.md
