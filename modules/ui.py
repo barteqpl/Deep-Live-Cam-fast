@@ -1006,8 +1006,10 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
             continue
 
         temp_frame = frame.copy()
-        run_detection = (proc_frame_index % DETECT_EVERY_N == 0)
         proc_frame_index += 1
+        # Run full face detection only every Nth frame; use tracker on others
+        DETECT_EVERY_N = 3
+        run_detection = (proc_frame_index % DETECT_EVERY_N == 1) or (cached_target_face is None and cached_many_faces is None)
 
         if modules.globals.live_mirror:
             temp_frame = gpu_flip(temp_frame, 1)
@@ -1132,6 +1134,8 @@ def create_webcam_preview(camera_index: int):
     )
     proc_thread.start()
 
+    streamer = None
+
     # Main (UI) thread: pull processed frames and update the display
     while not stop_event.is_set():
         try:
@@ -1139,6 +1143,14 @@ def create_webcam_preview(camera_index: int):
         except queue.Empty:
             ROOT.update()
             continue
+
+        if modules.globals.stream_udp:
+            if streamer is None:
+                from modules.streamer import UDPStreamer
+                height, width = temp_frame.shape[:2]
+                streamer = UDPStreamer(modules.globals.stream_udp, width, height, fps=30.0)
+                streamer.start()
+            streamer.write(temp_frame)
 
         if modules.globals.live_resizable:
             temp_frame = fit_image_to_size(
@@ -1166,6 +1178,8 @@ def create_webcam_preview(camera_index: int):
     cap_thread.join(timeout=2.0)
     proc_thread.join(timeout=2.0)
     cap.release()
+    if streamer is not None:
+        streamer.stop()
     PREVIEW.withdraw()
 
 

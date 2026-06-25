@@ -29,11 +29,8 @@ def get_face_analyser() -> Any:
                     providers=['CPUExecutionProvider'],
                     allowed_modules=['detection', 'recognition']
                 )
-                # Use user's execution providers for recognition model only
-                if 'recognition' in FACE_ANALYSER.models and modules.globals.execution_providers != ['CPUExecutionProvider']:
-                    FACE_ANALYSER.models['recognition'].session.set_providers(
-                        modules.globals.execution_providers
-                    )
+                # Keep recognition model on CPU to ensure thread-safety and avoid embedding corruption in sub-threads
+                pass
 
                 FACE_ANALYSER.prepare(ctx_id=0, det_size=(320, 320))
     return FACE_ANALYSER

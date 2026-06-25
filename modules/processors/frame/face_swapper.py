@@ -20,6 +20,91 @@ import os
 from collections import deque
 import time
 
+
+# FaceFusion-compatible warp templates for face alignment.
+# These differ subtly from insightface's built-in templates and must match
+# what the ONNX models were trained on.
+WARP_TEMPLATES = {
+    'arcface_112_v1': np.array([
+        [0.35473214, 0.45658929],
+        [0.64526786, 0.45658929],
+        [0.50000000, 0.61154464],
+        [0.37913393, 0.77687500],
+        [0.62086607, 0.77687500]
+    ]),
+    'arcface_128': np.array([
+        [0.36167656, 0.40387734],
+        [0.63696719, 0.40235469],
+        [0.50019687, 0.56044219],
+        [0.38710391, 0.72160547],
+        [0.61507734, 0.72034453]
+    ]),
+    'mtcnn_512': np.array([
+        [0.36562865, 0.46733799],
+        [0.63305391, 0.46585885],
+        [0.50019127, 0.61942959],
+        [0.39032951, 0.77598822],
+        [0.61178945, 0.77476328]
+    ]),
+}
+
+def _warp_face_by_template(img, kps, template_name, crop_size):
+    """Warp a face using FaceFusion's template-based alignment.
+    Returns the cropped+aligned face and the affine matrix."""
+    template = WARP_TEMPLATES[template_name] * np.array(crop_size, dtype=np.float32)
+    M = cv2.estimateAffinePartial2D(
+        kps.astype(np.float32), template.astype(np.float32),
+        method=cv2.RANSAC, ransacReprojThreshold=100
+    )[0]
+    crop = cv2.warpAffine(
+        img, M, tuple(crop_size),
+        borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA
+    )
+    return crop, M
+
+
+_CROP_MASK_CACHE = {}
+
+def get_crop_mask(size: int) -> np.ndarray:
+    """Pre-computes and caches elliptical crop masks to avoid expensive CPU-based
+    erode/blur operations on full frame sizes, while preventing box artifacts."""
+    if size not in _CROP_MASK_CACHE:
+        mask = np.zeros((size, size), dtype=np.float32)
+        center = (size // 2, int(size * 0.50)) # Center of face
+        axes = (int(size * 0.38), int(size * 0.45)) # Face-like ellipse
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+        
+        # Apply Gaussian blur to feather the boundary smoothly
+        k_blur = max(size // 8, 5)
+        if k_blur % 2 == 0:
+            k_blur += 1
+        mask = cv2.GaussianBlur(mask, (k_blur, k_blur), 0)
+        _CROP_MASK_CACHE[size] = mask
+    return _CROP_MASK_CACHE[size]
+
+
+class CrossfaceConverter:
+    """Loads and runs a crossface embedding converter ONNX model
+    (e.g. crossface_simswap.onnx / crossface_hififace.onnx).
+    These small networks (~22 MB) transform the raw ArcFace embedding
+    into the representation that SimSwap/HiFiFace were trained with."""
+
+    def __init__(self, model_path: str):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(
+            model_path, providers=['CPUExecutionProvider']
+        )
+
+    def convert(self, raw_embedding: np.ndarray) -> np.ndarray:
+        """Convert raw ArcFace embedding -> model-specific embedding.
+        Input shape: (512,) or (1, 512).  Returns shape (1, 512) float32."""
+        inp = raw_embedding.reshape(-1, 512).astype(np.float32)
+        out = self.session.run(None, {'input': inp})[0]
+        out = out.ravel()
+        out_norm = out / np.linalg.norm(out)
+        return out_norm.reshape(1, -1).astype(np.float32)
+
+
 class HiFiFaceSwapper:
     def __init__(self, model_path: str, providers: list, provider_options: list = None):
         import onnxruntime as ort
@@ -27,49 +112,62 @@ class HiFiFaceSwapper:
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
         self.input_size = (256, 256)
+        # FaceFusion config for hififace_unofficial_256
+        self.template = 'mtcnn_512'
+        self.mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        self.std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        # Load crossface embedding converter
+        self.crossface = None
+        for candidate in [
+            os.path.join(models_dir, 'crossface_hififace.onnx'),
+        ]:
+            if os.path.exists(candidate):
+                self.crossface = CrossfaceConverter(candidate)
+                update_status(f"HiFiFace crossface converter loaded from: {candidate}", "DLC.FACE-SWAPPER")
+                break
+        if self.crossface is None:
+            update_status("WARNING: crossface_hififace.onnx not found - identity transfer may be degraded", "DLC.FACE-SWAPPER")
 
     def get(self, img, target_face, source_face, paste_back=True):
-        from insightface.utils import face_align
-        
-        # 1. Align face to 256x256 using insightface's norm_crop2
-        aimg, M = face_align.norm_crop2(img, target_face.kps, 256)
-        
-        # 2. Convert BGR to RGB and scale to [-1.0, 1.0] range
-        aimg_rgb = cv2.cvtColor(aimg, cv2.COLOR_BGR2RGB)
-        blob = (aimg_rgb.astype(np.float32) / 127.5 - 1.0).transpose(2, 0, 1)
-        blob = np.expand_dims(blob, axis=0) # [1, 3, 256, 256]
-        
-        # 3. Get source embedding and reshape
-        latent = source_face.get("_hififace_latent", None)
-        if latent is None:
-            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32)
-            source_face._hififace_latent = latent
-            
-        # Copy to avoid ORT CoreML memory address caching crash
-        latent = latent.copy()
-        
+        # 1. Align face using FaceFusion's mtcnn_512 template
+        aimg, M = _warp_face_by_template(img, target_face.kps, self.template, self.input_size)
+
+        # 2. Preprocess: BGR -> RGB, normalize with mean/std
+        crop_rgb = aimg[:, :, ::-1].astype(np.float32) / 255.0
+        crop_rgb = (crop_rgb - self.mean) / self.std
+        blob = crop_rgb.transpose(2, 0, 1)
+        blob = np.expand_dims(blob, axis=0).astype(np.float32)
+
+        # 3. Convert source embedding through crossface converter
+        if self.crossface is not None:
+            latent = self.crossface.convert(source_face.embedding).copy()
+        else:
+            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+
         # 4. Inference
-        pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
+        with THREAD_LOCK:
+            pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
         pred_img = pred[0]
         pred_mask = pred[1]
-        
-        # 5. Convert swapped face back to BGR and scale to [0, 255]
-        img_fake = pred_img[0].transpose((1, 2, 0)) # [256, 256, 3] in RGB
-        bgr_fake = np.clip(127.5 * (img_fake + 1.0), 0, 255).astype(np.uint8)
-        bgr_fake = cv2.cvtColor(bgr_fake, cv2.COLOR_RGB2BGR)
-        
+
+        # 5. Denormalize output (FaceFusion: x * std + mean, clip [0,1], BGR, *255)
+        img_fake = pred_img[0].transpose((1, 2, 0))  # [256, 256, 3] RGB
+        img_fake = img_fake * self.std + self.mean
+        img_fake = np.clip(img_fake, 0, 1)
+        bgr_fake = (img_fake[:, :, ::-1] * 255).astype(np.uint8)
+
         if not paste_back:
             return bgr_fake, M
-            
+
         # 6. Paste back into original frame using model's output mask
         IM = cv2.invertAffineTransform(M)
         bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
-        
+
         # Process and warp the mask
-        mask_fake = pred_mask[0, 0] # [256, 256]
+        mask_fake = pred_mask[0, 0]  # [256, 256]
         mask_warped = cv2.warpAffine(mask_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
         mask_warped = np.reshape(mask_warped, [mask_warped.shape[0], mask_warped.shape[1], 1])
-        
+
         # Blend images: mask * swapped + (1 - mask) * original
         fake_merged = mask_warped * bgr_fake_warped.astype(np.float32) + (1.0 - mask_warped) * img.astype(np.float32)
         return fake_merged.astype(np.uint8)
@@ -81,71 +179,121 @@ class SimSwapSwapper:
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
         self.input_size = (256, 256)
+        # FaceFusion config for simswap_256
+        self.template = 'arcface_112_v1'
+        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # Load crossface embedding converter
+        self.crossface = None
+        for candidate in [
+            os.path.join(models_dir, 'crossface_simswap.onnx'),
+        ]:
+            if os.path.exists(candidate):
+                self.crossface = CrossfaceConverter(candidate)
+                update_status(f"SimSwap crossface converter loaded from: {candidate}", "DLC.FACE-SWAPPER")
+                break
+        if self.crossface is None:
+            update_status("WARNING: crossface_simswap.onnx not found - identity transfer may be degraded", "DLC.FACE-SWAPPER")
 
     def get(self, img, target_face, source_face, paste_back=True):
-        from insightface.utils import face_align
-        
-        # 1. Align face to 256x256 using insightface's norm_crop2
-        aimg, M = face_align.norm_crop2(img, target_face.kps, 256)
-        
-        # 2. Preprocess target image: BGR -> RGB and ImageNet scaling
-        aimg_rgb = cv2.cvtColor(aimg, cv2.COLOR_BGR2RGB)
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        blob = ((aimg_rgb.astype(np.float32) / 255.0 - mean) / std).transpose(2, 0, 1)
-        blob = np.expand_dims(blob, axis=0) # [1, 3, 256, 256]
-        
-        # 3. Get source embedding and reshape
-        latent = source_face.get("_simswap_latent", None)
-        if latent is None:
-            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32)
-            source_face._simswap_latent = latent
-            
-        # Copy to avoid ORT CoreML memory address caching crash
-        latent = latent.copy()
-        
+        # 1. Align face using FaceFusion's arcface_112_v1 template
+        aimg, M = _warp_face_by_template(img, target_face.kps, self.template, self.input_size)
+
+        # 2. Preprocess: BGR -> RGB, ImageNet normalization
+        crop_rgb = aimg[:, :, ::-1].astype(np.float32) / 255.0
+        crop_rgb = (crop_rgb - self.mean) / self.std
+        blob = crop_rgb.transpose(2, 0, 1)
+        blob = np.expand_dims(blob, axis=0).astype(np.float32)
+
+        # 3. Convert source embedding through crossface converter
+        if self.crossface is not None:
+            latent = self.crossface.convert(source_face.embedding).copy()
+        else:
+            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+
         # 4. Inference
-        pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
+        with THREAD_LOCK:
+            pred = self.session.run(self.output_names, {self.input_names[0]: blob, self.input_names[1]: latent})
         pred_img = pred[0]
-        
-        # 5. Convert swapped face back to BGR and scale from [0.0, 1.0] to [0, 255]
-        img_fake = pred_img[0].transpose((1, 2, 0)) # [256, 256, 3] in RGB
-        bgr_fake = np.clip(img_fake * 255.0, 0, 255).astype(np.uint8)
-        bgr_fake = cv2.cvtColor(bgr_fake, cv2.COLOR_RGB2BGR)
-        
+
+        # 5. Denormalize output: SimSwap outputs in [0, 1] range, no need for std/mean reversal
+        img_fake = pred_img[0].transpose((1, 2, 0))  # [256, 256, 3] in RGB
+        img_fake = np.clip(img_fake, 0, 1)
+        bgr_fake = (img_fake[:, :, ::-1] * 255).astype(np.uint8)
+
         if not paste_back:
             return bgr_fake, M
-            
-        # 6. Paste back into original frame using standard mask pipeline (scaled for 256x256)
+
+        # 6. Paste back using standard mask pipeline (scaled for 256x256)
         IM = cv2.invertAffineTransform(M)
         bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
-        
-        # Standard mask pipeline scaled to 256x256 target size
-        img_white = np.full((aimg.shape[0], aimg.shape[1]), 255, dtype=np.float32)
-        img_white = cv2.warpAffine(img_white, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
-        img_white[img_white > 20] = 255
-        
-        img_mask = img_white
-        mask_h_inds, mask_w_inds = np.where(img_mask == 255)
-        if len(mask_h_inds) > 0 and len(mask_w_inds) > 0:
-            mask_h = np.max(mask_h_inds) - np.min(mask_h_inds)
-            mask_w = np.max(mask_w_inds) - np.min(mask_w_inds)
-            mask_size = int(np.sqrt(mask_h * mask_w))
-            
-            k = max(mask_size // 10, 10)
-            kernel = np.ones((k, k), np.uint8)
-            img_mask = cv2.erode(img_mask, kernel, iterations=1)
-            
-            k = max(mask_size // 20, 5)
-            kernel_size = (k, k)
-            blur_size = tuple(2*i+1 for i in kernel_size)
-            img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
-        
+
+        # Paste back using pre-computed crop mask to avoid slow full-frame processing
+        crop_mask = get_crop_mask(self.input_size[0])
+        img_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
         img_mask /= 255.0
         img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
-        
+
         fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)
         return fake_merged.astype(np.uint8)
+
+
+class HyperSwapSwapper:
+    """FaceFusion's HyperSwap model (2025) - high quality, no crossface converter needed.
+    Uses arcface_128 template, mean/std = [0.5, 0.5, 0.5], normed_embedding directly."""
+    def __init__(self, model_path: str, providers: list, provider_options: list = None):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.input_names = [inp.name for inp in self.session.get_inputs()]
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        self.input_size = (256, 256)
+        self.template = 'arcface_128'
+        self.mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        self.std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        # 1. Align face using FaceFusion's arcface_128 template
+        aimg, M = _warp_face_by_template(img, target_face.kps, self.template, self.input_size)
+
+        # 2. Preprocess: BGR -> RGB, normalize with mean/std -> [-1, 1]
+        crop_rgb = aimg[:, :, ::-1].astype(np.float32) / 255.0
+        crop_rgb = (crop_rgb - self.mean) / self.std
+        blob = crop_rgb.transpose(2, 0, 1)
+        blob = np.expand_dims(blob, axis=0).astype(np.float32)
+
+        # 3. HyperSwap uses normed_embedding directly (no crossface needed)
+        latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+
+        # 4. Inference - HyperSwap input order: source=embedding, target=image
+        with THREAD_LOCK:
+            pred = self.session.run(self.output_names, {'source': latent, 'target': blob})
+        pred_img = pred[0]
+        pred_mask = pred[1]  # HyperSwap outputs a mask [1, 1, 256, 256]
+
+        # 5. Denormalize: x * std + mean, clip [0,1], convert to BGR uint8
+        img_fake = pred_img[0].transpose((1, 2, 0))
+        img_fake = img_fake * self.std + self.mean
+        img_fake = np.clip(img_fake, 0, 1)
+        bgr_fake = (img_fake[:, :, ::-1] * 255).astype(np.uint8)
+
+        if not paste_back:
+            return bgr_fake, M
+
+        # 6. Paste back using model's built-in mask (faster than manual erode/blur)
+        IM = cv2.invertAffineTransform(M)
+        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
+
+        # Use model-generated mask (crop space) -> warp to full frame
+        crop_mask = pred_mask[0, 0]  # [256, 256] float
+        crop_mask = np.clip(crop_mask, 0, 1).astype(np.float32)
+        full_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
+        # Slight blur for smoother blending
+        full_mask = cv2.GaussianBlur(full_mask, (5, 5), 0)
+        full_mask = np.reshape(full_mask, [full_mask.shape[0], full_mask.shape[1], 1])
+
+        fake_merged = full_mask * bgr_fake_warped + (1.0 - full_mask) * img.astype(np.float32)
+        return fake_merged.astype(np.uint8)
+
 
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
@@ -158,7 +306,7 @@ PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previou
 # --- START: Live stream detection-skip optimization ---
 _LIVE_DETECTION_COUNTER: int = 0
 _LIVE_LAST_FACES: list = []
-LIVE_DETECTION_INTERVAL: int = 8  # Detect every N frames
+LIVE_DETECTION_INTERVAL: int = 1  # Detect every N frames
 LIVE_TRACKER = None
 # --- END: Live stream detection-skip optimization ---
 
@@ -175,6 +323,8 @@ def get_model_name() -> str:
         return "hififace_unofficial_256.onnx"
     elif swapper_model == "simswap":
         return "simswap_256.onnx"
+    elif swapper_model == "hyperswap":
+        return "hyperswap_1a_256.onnx"
     # Use FP32 model on Apple Silicon with CoreML because FP16 has extreme partitioning overhead in CoreML EP
     if IS_APPLE_SILICON and modules.globals.execution_providers and "CoreMLExecutionProvider" in modules.globals.execution_providers:
         return "inswapper_128.onnx"
@@ -184,26 +334,45 @@ def get_model_name() -> str:
 def pre_check() -> bool:
     download_directory_path = models_dir
     model_name = get_model_name()
+    urls = []
+    
     if model_name == "hififace_unofficial_256.onnx":
-        url = "https://huggingface.co/netrunner-exe/Insight-Swap-models-onnx/resolve/main/hififace_unofficial_256.onnx"
+        urls.append("https://huggingface.co/facefusion/models-3.1.0/resolve/main/hififace_unofficial_256.onnx")
+        urls.append("https://huggingface.co/facefusion/models-3.4.0/resolve/main/crossface_hififace.onnx")
     elif model_name == "simswap_256.onnx":
-        url = "https://huggingface.co/netrunner-exe/Insight-Swap-models-onnx/resolve/main/simswap_256.onnx"
+        urls.append("https://huggingface.co/facefusion/models-3.0.0/resolve/main/simswap_256.onnx")
+        urls.append("https://huggingface.co/facefusion/models-3.4.0/resolve/main/crossface_simswap.onnx")
+    elif model_name == "hyperswap_1a_256.onnx":
+        urls.append("https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1a_256.onnx")
     elif model_name == "inswapper_128.onnx":
-        url = "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
+        urls.append("https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx")
     else:
-        url = "https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx"
+        urls.append("https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx")
+        
     conditional_download(
         download_directory_path,
-        [url],
+        urls,
     )
     return True
 
 
 def pre_start() -> bool:
-    model_path = os.path.join(models_dir, get_model_name())
+    model_name = get_model_name()
+    model_path = os.path.join(models_dir, model_name)
     if not os.path.exists(model_path):
         update_status(f"Model not found: {model_path}. Please download it.", NAME)
         return False
+
+    if model_name == "hififace_unofficial_256.onnx":
+        crossface_path = os.path.join(models_dir, "crossface_hififace.onnx")
+        if not os.path.exists(crossface_path):
+            update_status(f"Crossface converter not found: {crossface_path}. Please download it.", NAME)
+            return False
+    elif model_name == "simswap_256.onnx":
+        crossface_path = os.path.join(models_dir, "crossface_simswap.onnx")
+        if not os.path.exists(crossface_path):
+            update_status(f"Crossface converter not found: {crossface_path}. Please download it.", NAME)
+            return False
 
     # Try to get the face swapper to ensure it loads correctly
     if get_face_swapper() is None:
@@ -212,6 +381,7 @@ def pre_start() -> bool:
 
     # Add other essential checks if needed, e.g., target/source path validity
     return True
+
 
 
 def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
@@ -242,27 +412,9 @@ def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
     IM = cv2.invertAffineTransform(M)
     bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
     
-    # Original mask pipeline (zero quality degradation), but omitting the unused fake_diff
-    img_white = np.full((aimg.shape[0], aimg.shape[1]), 255, dtype=np.float32)
-    img_white = cv2.warpAffine(img_white, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
-    img_white[img_white > 20] = 255
-    
-    img_mask = img_white
-    mask_h_inds, mask_w_inds = np.where(img_mask == 255)
-    if len(mask_h_inds) > 0 and len(mask_w_inds) > 0:
-        mask_h = np.max(mask_h_inds) - np.min(mask_h_inds)
-        mask_w = np.max(mask_w_inds) - np.min(mask_w_inds)
-        mask_size = int(np.sqrt(mask_h * mask_w))
-        
-        k = max(mask_size // 10, 10)
-        kernel = np.ones((k, k), np.uint8)
-        img_mask = cv2.erode(img_mask, kernel, iterations=1)
-        
-        k = max(mask_size // 20, 5)
-        kernel_size = (k, k)
-        blur_size = tuple(2*i+1 for i in kernel_size)
-        img_mask = cv2.GaussianBlur(img_mask, blur_size, 0)
-    
+    # Paste back using pre-computed crop mask to avoid slow full-frame processing
+    crop_mask = get_crop_mask(aimg.shape[0])
+    img_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
     img_mask /= 255.0
     img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
     
@@ -288,9 +440,9 @@ def get_face_swapper() -> Any:
                             "CoreMLExecutionProvider",
                             {
                                 "ModelFormat": "MLProgram",
-                                "MLComputeUnits": "ALL",
+                                "MLComputeUnits": "CPUAndGPU",
                                 "SpecializationStrategy": "FastPrediction",
-                                "AllowLowPrecisionAccumulationOnGPU": 1,
+                                "AllowLowPrecisionAccumulationOnGPU": 0,
                                 "EnableOnSubgraphs": 1,
                             }
                         ))
@@ -301,6 +453,8 @@ def get_face_swapper() -> Any:
                     FACE_SWAPPER = HiFiFaceSwapper(model_path, providers=providers_config)
                 elif model_name == "simswap_256.onnx":
                     FACE_SWAPPER = SimSwapSwapper(model_path, providers=providers_config)
+                elif model_name == "hyperswap_1a_256.onnx":
+                    FACE_SWAPPER = HyperSwapSwapper(model_path, providers=providers_config)
                 else:
                     FACE_SWAPPER = insightface.model_zoo.get_model(
                         model_path,
