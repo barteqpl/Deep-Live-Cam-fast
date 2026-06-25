@@ -18,6 +18,7 @@ class TestNewFeatures(unittest.TestCase):
         # Reset globals and cache
         modules.globals.swapper_model = "inswapper"
         modules.globals.execution_providers = ["CPUExecutionProvider"]
+        modules.globals.headless = True
         _CROP_MASK_CACHE.clear()
 
     def test_crop_mask_cache(self):
@@ -104,6 +105,60 @@ class TestNewFeatures(unittest.TestCase):
                 self.assertEqual(modules.globals.interpolation_weight, 0.25)
                 self.assertEqual(modules.globals.sharpness, 0.45)
                 self.assertEqual(modules.globals.stream_udp, "6000")
+
+    @patch("shutil.which")
+    def test_pre_check(self, mock_which):
+        from modules.core import pre_check
+        
+        # Test success (ffmpeg installed)
+        mock_which.return_value = "/usr/bin/ffmpeg"
+        with patch("sys.version_info", (3, 11, 0)):
+            self.assertTrue(pre_check())
+            
+        # Test failure (ffmpeg missing)
+        mock_which.return_value = None
+        with patch("sys.version_info", (3, 11, 0)):
+            self.assertFalse(pre_check())
+
+    @patch("platform.system")
+    def test_limit_resources_darwin(self, mock_system):
+        from modules.core import limit_resources
+        mock_system.return_value = "Darwin"
+        
+        modules.globals.max_memory = 4 # 4 GB
+        
+        # Patch resource module
+        mock_resource = MagicMock()
+        mock_resource.RLIM_INFINITY = -1
+        mock_resource.RLIMIT_DATA = 2
+        mock_resource.getrlimit.return_value = (1024, 2048)
+        
+        with patch.dict("sys.modules", {"resource": mock_resource}):
+            limit_resources()
+            mock_resource.getrlimit.assert_called_once_with(mock_resource.RLIMIT_DATA)
+            # Should set to min(requested_memory, hard) -> min(4GB, 2048) -> 2048
+            mock_resource.setrlimit.assert_called_once_with(mock_resource.RLIMIT_DATA, (2048, 2048))
+
+    @patch("platform.system")
+    def test_limit_resources_darwin_error_handling(self, mock_system):
+        from modules.core import limit_resources
+        mock_system.return_value = "Darwin"
+        
+        modules.globals.max_memory = 4 # 4 GB
+        
+        # Test that ValueError/OSError raised by setrlimit are caught and ignored
+        mock_resource = MagicMock()
+        mock_resource.RLIM_INFINITY = -1
+        mock_resource.RLIMIT_DATA = 2
+        mock_resource.getrlimit.return_value = (1024, 2048)
+        mock_resource.setrlimit.side_effect = ValueError("current limit exceeds maximum limit")
+        
+        with patch.dict("sys.modules", {"resource": mock_resource}):
+            # Should not raise ValueError
+            try:
+                limit_resources()
+            except ValueError:
+                self.fail("limit_resources() raised ValueError unexpectedly!")
 
 if __name__ == "__main__":
     unittest.main()

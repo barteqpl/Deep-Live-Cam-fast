@@ -68,8 +68,8 @@ def get_crop_mask(size: int) -> np.ndarray:
     erode/blur operations on full frame sizes, while preventing box artifacts."""
     if size not in _CROP_MASK_CACHE:
         mask = np.zeros((size, size), dtype=np.float32)
-        center = (size // 2, int(size * 0.50)) # Center of face
-        axes = (int(size * 0.38), int(size * 0.45)) # Face-like ellipse
+        center = (size // 2, int(size * 0.52)) # Center of face shifted down to cover chin
+        axes = (int(size * 0.38), int(size * 0.47)) # Vertically longer to cover chin/jawline
         cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
         
         # Apply Gaussian blur to feather the boundary smoothly
@@ -163,6 +163,10 @@ class HiFiFaceSwapper:
 
         # Process and warp the mask
         mask_fake = pred_mask[0, 0]  # [256, 256]
+        # Enhance chin coverage by blending in the lower portion of the elliptical mask
+        eliptic = get_crop_mask(256) / 255.0
+        mask_fake[130:, :] = np.maximum(mask_fake[130:, :], eliptic[130:, :])
+
         mask_warped = cv2.warpAffine(mask_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
         mask_warped = np.reshape(mask_warped, [mask_warped.shape[0], mask_warped.shape[1], 1])
 
@@ -284,6 +288,9 @@ class HyperSwapSwapper:
         # Use model-generated mask (crop space) -> warp to full frame
         crop_mask = pred_mask[0, 0]  # [256, 256] float
         crop_mask = np.clip(crop_mask, 0, 1).astype(np.float32)
+        # Enhance chin coverage by blending in the lower portion of the elliptical mask
+        eliptic = get_crop_mask(256) / 255.0
+        crop_mask[130:, :] = np.maximum(crop_mask[130:, :], eliptic[130:, :])
         full_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
         # Slight blur for smoother blending
         full_mask = cv2.GaussianBlur(full_mask, (5, 5), 0)
