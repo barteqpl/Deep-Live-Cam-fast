@@ -27,13 +27,13 @@ The following statistics represent the average time of the face swap operation (
 - **HyperSwap 256**: **~151.59 ms** per frame (**~6.6 FPS**).
 
 > [!NOTE]
-> Thanks to the implemented mask caching in [face_swapper.py](file:///Users/barteq/repos/ai/Deep-Live-Cam/modules/processors/frame/face_swapper.py#L65), the post-processing time has dropped from several milliseconds to **<0.1 ms**, which allows maintaining a frame rate limited almost exclusively by the speed of the CoreML network itself.
+> Thanks to the implemented mask caching in [face_swapper.py](modules/processors/frame/face_swapper.py#L65), the post-processing time has dropped from several milliseconds to **<0.1 ms**, which allows maintaining a frame rate limited almost exclusively by the speed of the CoreML network itself.
 
 ---
 
-## 3. Automatic Model Downloading
+## 3. Available Models Auto-downloading
 
-Missing models are automatically downloaded on the first run of the application by the [pre_check](file:///Users/barteq/repos/ai/Deep-Live-Cam/modules/processors/frame/face_swapper.py#L334) function from Hugging Face servers:
+Missing models are automatically downloaded on the first run of the application by the [pre_check](modules/processors/frame/face_swapper.py#L334) function from Hugging Face servers:
 - For **HiFiFace**: the main file `hififace_unofficial_256.onnx` and the embedding converter `crossface_hififace.onnx` are downloaded.
 - For **SimSwap**: the main file `simswap_256.onnx` and the embedding converter `crossface_simswap.onnx` are downloaded.
 - Files are saved directly in the `models/` project directory.
