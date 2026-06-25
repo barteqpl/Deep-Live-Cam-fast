@@ -44,13 +44,15 @@ FFHQ_TEMPLATE_512 = np.array(
 
 
 def pre_check() -> bool:
-    model_path = os.path.join(models_dir, "gfpgan-1024.onnx")
-    if not os.path.exists(model_path):
-        update_status("Downloading gfpgan-1024.onnx...", NAME)
+    # Prefer GFPGANv1.4.onnx as it is faster (512x512)
+    model_path_512 = os.path.join(models_dir, "GFPGANv1.4.onnx")
+    model_path_1024 = os.path.join(models_dir, "gfpgan-1024.onnx")
+    if not os.path.exists(model_path_512) and not os.path.exists(model_path_1024):
+        update_status("Downloading GFPGANv1.4.onnx...", NAME)
         from modules.utilities import conditional_download
         conditional_download(
             models_dir,
-            ["https://huggingface.co/hacksider/deep-live-cam/resolve/main/gfpgan-1024.onnx"]
+            ["https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx"]
         )
     return True
 
@@ -73,15 +75,22 @@ def get_face_enhancer() -> onnxruntime.InferenceSession:
 
     with THREAD_LOCK:
         if FACE_ENHANCER is None:
-            model_path = os.path.join(models_dir, "gfpgan-1024.onnx")
+            # Prefer GFPGANv1.4.onnx (faster, 512x512), fallback to gfpgan-1024.onnx if already present
+            model_path_512 = os.path.join(models_dir, "GFPGANv1.4.onnx")
+            model_path_1024 = os.path.join(models_dir, "gfpgan-1024.onnx")
 
-            if not os.path.exists(model_path):
-                update_status("Downloading gfpgan-1024.onnx...", NAME)
+            if os.path.exists(model_path_512):
+                model_path = model_path_512
+            elif os.path.exists(model_path_1024):
+                model_path = model_path_1024
+            else:
+                update_status("Downloading GFPGANv1.4.onnx...", NAME)
                 from modules.utilities import conditional_download
                 conditional_download(
                     models_dir,
-                    ["https://huggingface.co/hacksider/deep-live-cam/resolve/main/gfpgan-1024.onnx"]
+                    ["https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx"]
                 )
+                model_path = model_path_512
 
             try:
                 from modules.processors.frame._onnx_enhancer import (
@@ -376,11 +385,15 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
             # Reuse cached enhanced face — just paste back onto current frame
             cached = _enh_live_cache
             if cached['enhanced_bgr'] is not None:
-                _paste_back(
-                    temp_frame, cached['enhanced_bgr'],
-                    cached['affine_matrix'],
-                    output_size=cached['align_size'],
+                _, current_affine_matrix = _align_face(
+                    temp_frame, landmarks_5, output_size=cached['align_size']
                 )
+                if current_affine_matrix is not None:
+                    _paste_back(
+                        temp_frame, cached['enhanced_bgr'],
+                        current_affine_matrix,
+                        output_size=cached['align_size'],
+                    )
         if not many_faces_mode:
             break  # single-face live mode — only process first face
 

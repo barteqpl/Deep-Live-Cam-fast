@@ -3,9 +3,9 @@ import mimetypes
 import os
 import platform
 import shutil
+import urllib.request
 import ssl
 import subprocess
-import urllib
 from pathlib import Path
 from typing import List, Any
 from tqdm import tqdm
