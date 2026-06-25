@@ -3,14 +3,12 @@ import webbrowser
 import customtkinter as ctk
 from typing import Callable, Tuple
 import cv2
-from cv2_enumerate_cameras import enumerate_cameras  # Add this import
 from modules.gpu_processing import gpu_cvt_color, gpu_resize, gpu_flip
 from PIL import Image, ImageOps
 import time
 import json
 import queue
 import threading
-import numpy as np
 import modules.globals
 import modules.metadata
 from modules.face_analyser import (
@@ -33,7 +31,6 @@ from modules.utilities import (
 )
 from modules.video_capture import VideoCapturer
 from modules.gettext import LanguageManager
-from modules import globals
 import platform
 
 if platform.system() == "Windows":
@@ -481,7 +478,7 @@ def close_mapper_window():
 
 
 def analyze_target(start: Callable[[], None], root: ctk.CTk):
-    if POPUP != None and POPUP.winfo_exists():
+    if POPUP is not None and POPUP.winfo_exists():
         update_status("Please complete pop-up or close it.")
         return
 
@@ -542,7 +539,7 @@ def create_source_target_popup(
 
         x_label = ctk.CTkLabel(
             scrollable_frame,
-            text=f"X",
+            text="X",
             width=MAPPER_PREVIEW_MAX_WIDTH,
             height=MAPPER_PREVIEW_MAX_HEIGHT,
         )
@@ -1273,7 +1270,7 @@ def refresh_data(map: list):
 
         x_label = ctk.CTkLabel(
             scrollable_frame,
-            text=f"X",
+            text="X",
             width=MAPPER_PREVIEW_MAX_WIDTH,
             height=MAPPER_PREVIEW_MAX_HEIGHT,
         )
