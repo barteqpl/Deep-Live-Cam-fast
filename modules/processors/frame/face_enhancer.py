@@ -327,8 +327,9 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
     # AND we're in single-face mode — the cache holds exactly one enhancement,
     # so reusing it in many_faces mode would paste the same face onto every
     # detected target.
-    many_faces_mode = getattr(modules.globals, "many_faces", False)
-    use_cache = detected_faces is not None and not many_faces_mode
+    # Temporal caching is disabled because dynamic warping of cached enhanced faces
+    # causes significant face distortion/stretching artifacts when the head moves.
+    use_cache = False
     if use_cache:
         _enh_live_cache['frame_count'] += 1
         run_inference_this_frame = (_enh_live_cache['frame_count'] % _ENH_INTERVAL == 0
