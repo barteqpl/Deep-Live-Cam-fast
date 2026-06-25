@@ -405,7 +405,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
 
     # 2) Transparency label and slider (placed ABOVE sharpness)
     transparency_label = ctk.CTkLabel(root, text="Transparency:")
-    transparency_label.place(relx=0.15, rely=0.75, relwidth=0.2, relheight=0.05)
+    transparency_label.place(relx=0.15, rely=0.72, relwidth=0.2, relheight=0.04)
 
     transparency_slider = ctk.CTkSlider(
         root,
@@ -421,7 +421,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         border_width=1,
         corner_radius=3,
     )
-    transparency_slider.place(relx=0.35, rely=0.77, relwidth=0.5, relheight=0.02)
+    transparency_slider.place(relx=0.35, rely=0.74, relwidth=0.5, relheight=0.02)
 
     # 3) Sharpness label & slider
     sharpness_var = ctk.DoubleVar(value=0.15)  # start at 0.15
@@ -430,7 +430,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         update_status(f"Sharpness set to {value:.1f}")
 
     sharpness_label = ctk.CTkLabel(root, text="Sharpness:")
-    sharpness_label.place(relx=0.15, rely=0.80, relwidth=0.2, relheight=0.05)
+    sharpness_label.place(relx=0.15, rely=0.77, relwidth=0.2, relheight=0.04)
 
     sharpness_slider = ctk.CTkSlider(
         root,
@@ -446,7 +446,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         border_width=1,
         corner_radius=3,
     )
-    sharpness_slider.place(relx=0.35, rely=0.82, relwidth=0.5, relheight=0.02)
+    sharpness_slider.place(relx=0.35, rely=0.79, relwidth=0.5, relheight=0.02)
 
     # 4) Chin Blend weight label & slider
     chin_blend_var = ctk.DoubleVar(value=1.0) # start at 1.0
@@ -455,7 +455,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         update_status(f"Chin blend strength set to {value * 100:.0f}%")
         
     chin_blend_label = ctk.CTkLabel(root, text="Chin Blend:")
-    chin_blend_label.place(relx=0.15, rely=0.85, relwidth=0.2, relheight=0.05)
+    chin_blend_label.place(relx=0.15, rely=0.82, relwidth=0.2, relheight=0.04)
     
     chin_blend_slider = ctk.CTkSlider(
         root,
@@ -471,7 +471,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         border_width=1,
         corner_radius=3,
     )
-    chin_blend_slider.place(relx=0.35, rely=0.87, relwidth=0.5, relheight=0.02)
+    chin_blend_slider.place(relx=0.35, rely=0.84, relwidth=0.5, relheight=0.02)
 
     # Status and link at the bottom
     global status_label
