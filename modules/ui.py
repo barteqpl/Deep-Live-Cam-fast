@@ -114,7 +114,7 @@ def save_switch_states():
         "fp_ui": modules.globals.fp_ui,
         "show_fps": modules.globals.show_fps,
         "mouth_mask": modules.globals.mouth_mask,
-        "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
+        "show_mouth_mask_box": False,
         "swapper_model": modules.globals.swapper_model,
     }
     with open("switch_states.json", "w") as f:
@@ -138,9 +138,7 @@ def load_switch_states():
         modules.globals.fp_ui = switch_states.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = switch_states.get("show_fps", False)
         modules.globals.mouth_mask = switch_states.get("mouth_mask", False)
-        modules.globals.show_mouth_mask_box = switch_states.get(
-            "show_mouth_mask_box", False
-        )
+        modules.globals.show_mouth_mask_box = False
         modules.globals.swapper_model = switch_states.get("swapper_model", "inswapper")
     except FileNotFoundError:
         # If the file doesn't exist, use default values
@@ -214,19 +212,6 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     )
     keep_frames_switch.place(relx=0.1, rely=0.40)
 
-    enhancer_value = ctk.BooleanVar(value=modules.globals.fp_ui["face_enhancer"])
-    enhancer_switch = ctk.CTkSwitch(
-        root,
-        text=_("Face Enhancer"),
-        variable=enhancer_value,
-        cursor="hand2",
-        command=lambda: (
-            update_tumbler("face_enhancer", enhancer_value.get()),
-            save_switch_states(),
-        ),
-    )
-    enhancer_switch.place(relx=0.1, rely=0.45)
-
     keep_audio_value = ctk.BooleanVar(value=modules.globals.keep_audio)
     keep_audio_switch = ctk.CTkSwitch(
         root,
@@ -269,6 +254,19 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     #    nsfw_value = ctk.BooleanVar(value=modules.globals.nsfw_filter)
     #    nsfw_switch = ctk.CTkSwitch(root, text='NSFW filter', variable=nsfw_value, cursor='hand2', command=lambda: setattr(modules.globals, 'nsfw_filter', nsfw_value.get()))
     #    nsfw_switch.place(relx=0.6, rely=0.7)
+
+    enhancer_value = ctk.BooleanVar(value=modules.globals.fp_ui["face_enhancer"])
+    enhancer_switch = ctk.CTkSwitch(
+        root,
+        text=_("Face Enhancer"),
+        variable=enhancer_value,
+        cursor="hand2",
+        command=lambda: (
+            update_tumbler("face_enhancer", enhancer_value.get()),
+            save_switch_states(),
+        ),
+    )
+    enhancer_switch.place(relx=0.1, rely=0.45)
 
     map_faces = ctk.BooleanVar(value=modules.globals.map_faces)
     map_faces_switch = ctk.CTkSwitch(
@@ -378,17 +376,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     )
     mouth_mask_switch.place(relx=0.1, rely=0.30)
 
-    show_mouth_mask_box_var = ctk.BooleanVar(value=modules.globals.show_mouth_mask_box)
-    show_mouth_mask_box_switch = ctk.CTkSwitch(
-        root,
-        text=_("Show Mouth Mask Box"),
-        variable=show_mouth_mask_box_var,
-        cursor="hand2",
-        command=lambda: setattr(
-            modules.globals, "show_mouth_mask_box", show_mouth_mask_box_var.get()
-        ),
-    )
-    show_mouth_mask_box_switch.place(relx=0.6, rely=0.30)
+
 
     start_button = ctk.CTkButton(
         root, text=_("Start"), cursor="hand2", command=lambda: analyze_target(start, root)
