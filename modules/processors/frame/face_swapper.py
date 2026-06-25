@@ -163,9 +163,12 @@ class HiFiFaceSwapper:
 
         # Process and warp the mask
         mask_fake = pred_mask[0, 0]  # [256, 256]
-        # Enhance chin coverage by blending in the lower portion of the elliptical mask
+        # Smoothly enhance chin coverage using an elliptical mask transition from Y=100 to Y=140
+        y_indices = np.arange(256).reshape(256, 1)
+        blend_weight = np.clip((y_indices - 100) / 40.0, 0.0, 1.0).astype(np.float32)
         eliptic = get_crop_mask(256) / 255.0
-        mask_fake[130:, :] = np.maximum(mask_fake[130:, :], eliptic[130:, :])
+        combined_mask = np.maximum(mask_fake, eliptic)
+        mask_fake = (1.0 - blend_weight) * mask_fake + blend_weight * combined_mask
 
         mask_warped = cv2.warpAffine(mask_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
         mask_warped = np.reshape(mask_warped, [mask_warped.shape[0], mask_warped.shape[1], 1])
@@ -288,9 +291,12 @@ class HyperSwapSwapper:
         # Use model-generated mask (crop space) -> warp to full frame
         crop_mask = pred_mask[0, 0]  # [256, 256] float
         crop_mask = np.clip(crop_mask, 0, 1).astype(np.float32)
-        # Enhance chin coverage by blending in the lower portion of the elliptical mask
+        # Smoothly enhance chin coverage using an elliptical mask transition from Y=100 to Y=140
+        y_indices = np.arange(256).reshape(256, 1)
+        blend_weight = np.clip((y_indices - 100) / 40.0, 0.0, 1.0).astype(np.float32)
         eliptic = get_crop_mask(256) / 255.0
-        crop_mask[130:, :] = np.maximum(crop_mask[130:, :], eliptic[130:, :])
+        combined_mask = np.maximum(crop_mask, eliptic)
+        crop_mask = (1.0 - blend_weight) * crop_mask + blend_weight * combined_mask
         full_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
         # Slight blur for smoother blending
         full_mask = cv2.GaussianBlur(full_mask, (5, 5), 0)
