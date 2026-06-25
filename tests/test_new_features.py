@@ -88,5 +88,22 @@ class TestNewFeatures(unittest.TestCase):
         mock_process.stdin.close.assert_called_once()
         mock_process.terminate.assert_called_once()
 
+    def test_argument_parsing(self):
+        from modules.core import parse_args
+        test_argv = [
+            "run.py",
+            "--disable-interpolation",
+            "--interpolation-weight", "0.25",
+            "--sharpness", "0.45",
+            "--stream-udp", "6000"
+        ]
+        with patch("sys.argv", test_argv):
+            with patch("modules.core.destroy"): # Avoid actually binding destroy signals
+                parse_args()
+                self.assertFalse(modules.globals.enable_interpolation)
+                self.assertEqual(modules.globals.interpolation_weight, 0.25)
+                self.assertEqual(modules.globals.sharpness, 0.45)
+                self.assertEqual(modules.globals.stream_udp, "6000")
+
 if __name__ == "__main__":
     unittest.main()
