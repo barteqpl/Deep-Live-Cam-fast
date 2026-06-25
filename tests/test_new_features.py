@@ -62,6 +62,36 @@ class TestNewFeatures(unittest.TestCase):
         modules.globals.swapper_model = "hyperswap"
         self.assertEqual(get_model_name(), "hyperswap_1a_256.onnx")
 
+    def test_clear_face_swapper(self):
+        import modules.processors.frame.face_swapper as face_swapper
+        mock_swapper = MagicMock()
+        face_swapper.FACE_SWAPPER = mock_swapper
+        self.assertIs(face_swapper.FACE_SWAPPER, mock_swapper)
+
+        face_swapper.clear_face_swapper()
+        self.assertIsNone(face_swapper.FACE_SWAPPER)
+
+    def test_ui_swapper_model_persistence(self):
+        import modules.ui as ui
+        import json
+
+        # Set a test model
+        modules.globals.swapper_model = "simswap"
+
+        # Save states
+        ui.save_switch_states()
+
+        # Verify it was saved to the JSON file
+        self.assertTrue(os.path.exists("switch_states.json"))
+        with open("switch_states.json", "r") as f:
+            data = json.load(f)
+        self.assertEqual(data.get("swapper_model"), "simswap")
+
+        # Reset globals and load states
+        modules.globals.swapper_model = "inswapper"
+        ui.load_switch_states()
+        self.assertEqual(modules.globals.swapper_model, "simswap")
+
     @patch("subprocess.Popen")
     def test_udp_streamer(self, mock_popen):
         # Set up mock process

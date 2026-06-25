@@ -82,6 +82,11 @@ target_label_dict_live = {}
 
 img_ft, vid_ft = modules.globals.file_types
 
+CAMERA_VARIABLE = None
+CAMERA_INDICES = None
+CAMERA_NAMES = None
+WEBCAM_STOP_EVENT = None
+
 
 def init(start: Callable[[], None], destroy: Callable[[], None], lang: str) -> ctk.CTk:
     global ROOT, PREVIEW, _
@@ -110,6 +115,7 @@ def save_switch_states():
         "show_fps": modules.globals.show_fps,
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": modules.globals.show_mouth_mask_box,
+        "swapper_model": modules.globals.swapper_model,
     }
     with open("switch_states.json", "w") as f:
         json.dump(switch_states, f)
@@ -135,6 +141,7 @@ def load_switch_states():
         modules.globals.show_mouth_mask_box = switch_states.get(
             "show_mouth_mask_box", False
         )
+        modules.globals.swapper_model = switch_states.get("swapper_model", "inswapper")
     except FileNotFoundError:
         # If the file doesn't exist, use default values
         pass
@@ -290,6 +297,64 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     )
     poisson_blend_switch.place(relx=0.1, rely=0.55)
 
+    # --- Model Selection ---
+    def safe_update_status(text: str) -> None:
+        if threading.current_thread() is threading.main_thread():
+            update_status(text)
+        else:
+            ROOT.after(0, lambda: update_status(text))
+
+    def destroy_and_reload_model(new_model: str, restart_live: bool = False):
+        safe_update_status("Destroying model session...")
+        import modules.processors.frame.face_swapper as face_swapper
+        face_swapper.clear_face_swapper()
+
+        safe_update_status(f"Loading model {new_model}...")
+
+        def load_task():
+            try:
+                if face_swapper.pre_check() and face_swapper.pre_start():
+                    safe_update_status(f"Model {new_model} loaded successfully.")
+                    if restart_live:
+                        try:
+                            global CAMERA_VARIABLE, CAMERA_INDICES, CAMERA_NAMES
+                            cam_name = CAMERA_VARIABLE.get() if CAMERA_VARIABLE else None
+                            cam_idx = CAMERA_INDICES[CAMERA_NAMES.index(cam_name)] if CAMERA_NAMES and cam_name and cam_name != "No cameras found" else None
+                            if cam_idx is not None:
+                                ROOT.after(100, lambda: webcam_preview(ROOT, cam_idx))
+                        except Exception as e:
+                            safe_update_status(f"Error restarting live preview: {e}")
+                else:
+                    safe_update_status(f"Failed to load model {new_model}.")
+            except Exception as e:
+                safe_update_status(f"Error loading model: {e}")
+
+        threading.Thread(target=load_task, daemon=True).start()
+
+    def on_model_change(new_model: str):
+        global WEBCAM_STOP_EVENT
+        modules.globals.swapper_model = new_model
+        save_switch_states()
+
+        if WEBCAM_STOP_EVENT is not None:
+            safe_update_status("Stopping live preview...")
+            WEBCAM_STOP_EVENT.set()
+            ROOT.after(500, lambda: destroy_and_reload_model(new_model, restart_live=True))
+        else:
+            destroy_and_reload_model(new_model, restart_live=False)
+
+    model_label = ctk.CTkLabel(root, text=_("Model:"))
+    model_label.place(relx=0.6, rely=0.55)
+
+    model_variable = ctk.StringVar(value=modules.globals.swapper_model)
+    model_optionmenu = ctk.CTkOptionMenu(
+        root,
+        variable=model_variable,
+        values=["inswapper", "hififace", "simswap", "hyperswap"],
+        command=on_model_change,
+    )
+    model_optionmenu.place(relx=0.74, rely=0.545, relwidth=0.21, relheight=0.04)
+
     show_fps_value = ctk.BooleanVar(value=modules.globals.show_fps)
     show_fps_switch = ctk.CTkSwitch(
         root,
@@ -347,6 +412,10 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     available_cameras = get_available_cameras()
     camera_indices, camera_names = available_cameras
 
+    global CAMERA_VARIABLE, CAMERA_INDICES, CAMERA_NAMES
+    CAMERA_INDICES = camera_indices
+    CAMERA_NAMES = camera_names
+
     if not camera_names or camera_names[0] == "No cameras found":
         camera_variable = ctk.StringVar(value="No cameras found")
         camera_optionmenu = ctk.CTkOptionMenu(
@@ -362,6 +431,8 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         )
 
     camera_optionmenu.place(relx=0.35, rely=0.83, relwidth=0.25, relheight=0.05)
+
+    CAMERA_VARIABLE = camera_variable
 
     live_button = ctk.CTkButton(
         root,
@@ -1124,7 +1195,7 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
 
 
 def create_webcam_preview(camera_index: int):
-    global preview_label, PREVIEW
+    global preview_label, PREVIEW, WEBCAM_STOP_EVENT
 
     cap = VideoCapturer(camera_index)
     if not cap.start(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, 60):
@@ -1139,6 +1210,7 @@ def create_webcam_preview(camera_index: int):
     capture_queue = queue.Queue(maxsize=2)
     processed_queue = queue.Queue(maxsize=2)
     stop_event = threading.Event()
+    WEBCAM_STOP_EVENT = stop_event
 
     # Start capture thread
     cap_thread = threading.Thread(
@@ -1197,6 +1269,7 @@ def create_webcam_preview(camera_index: int):
 
     # Signal threads to stop and wait for them
     stop_event.set()
+    WEBCAM_STOP_EVENT = None
     cap_thread.join(timeout=2.0)
     proc_thread.join(timeout=2.0)
     cap.release()

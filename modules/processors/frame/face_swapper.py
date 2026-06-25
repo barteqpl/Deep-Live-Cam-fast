@@ -501,6 +501,12 @@ def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
     return fake_merged.astype(np.uint8)
 
 
+def clear_face_swapper() -> None:
+    global FACE_SWAPPER
+    with THREAD_LOCK:
+        FACE_SWAPPER = None
+
+
 def get_face_swapper() -> Any:
     global FACE_SWAPPER
 
