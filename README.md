@@ -116,194 +116,121 @@ For benchmarks and detailed model recommendations, see the [DOCS_MODELS.md](file
 **Please be aware that the installation requires technical skills and is not for beginners. Consider downloading the quickstart version.**
 
 <details>
-<summary>Click to see the process</summary>
+<summary>Click to see the manual installation process</summary>
 
-### Installation
+### 📦 Prerequisites & System Setup
 
-This is more likely to work on your computer but will be slower as it utilizes the CPU.
+Ensure you have the following installed on your system before proceeding:
 
-**1. Set up Your Platform**
+*   **Python**: Version **3.11** is highly recommended (mandatory for macOS CoreML compatibility).
+*   **Git** & **Pip**
+*   **FFmpeg**: Required for video processing and live UDP streaming.
+    *   *macOS*: `brew install ffmpeg`
+    *   *Windows*: `choco install ffmpeg` or download from [ffmpeg.org](https://ffmpeg.org)
+    *   *Linux*: `sudo apt install ffmpeg`
 
--   Python (3.11 recommended)
--   pip
--   git
--   [ffmpeg](https://www.youtube.com/watch?v=OlNWCpFdVMA) - ```iex (irm ffmpeg.tc.ht)```
--   [Visual Studio 2022 Runtimes (Windows)](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+---
 
-**2. Clone the Repository**
+### 1. Clone the Repository
+
+Clone this optimized version of the project:
 
 ```bash
-git clone https://github.com/hacksider/Deep-Live-Cam.git
-cd Deep-Live-Cam
+git clone https://github.com/barteqpl/Deep-Live-Cam-fast.git
+cd Deep-Live-Cam-fast
 ```
 
-**3. Download the Models**
+---
 
-1. [GFPGANv1.4](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx)
-2. [inswapper\_128\_fp16.onnx](https://huggingface.co/hacksider/deep-live-cam/resolve/main/inswapper_128_fp16.onnx)
+### 2. Set Up Virtual Environment
 
-Place these files in the "**models**" folder.
+We strongly recommend using a virtual environment (`venv`) to avoid package dependency conflicts.
 
-**4. Install Dependencies**
-
-We highly recommend using a `venv` to avoid issues.
-
-
-For Windows:
+**macOS & Linux:**
 ```bash
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-```
-For Linux:
-```bash
-# Ensure you use the installed Python 3.11
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-**For macOS:**
-
-Apple Silicon (M1/M2/M3) requires specific setup:
-
-```bash
-# Install Python 3.11 (specific version is important)
-brew install python@3.11
-
-# Install tkinter package (required for the GUI)
-brew install python-tk@3.11
-
-# Create and activate virtual environment with Python 3.11
 python3.11 -m venv venv
 source venv/bin/activate
+```
 
-# Install dependencies
+**Windows (PowerShell):**
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+---
+
+### 3. Install Dependencies
+
+Install the core dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-** In case something goes wrong and you need to reinstall the virtual environment **
-
+*Note on GFPGAN/BasicSR issues*: If you get build/installation errors for `BasicSR` or `GFPGAN`, run:
 ```bash
-# Deactivate the virtual environment
-rm -rf venv
-
-# Reinstall the virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# install the dependencies again
-pip install -r requirements.txt
-
-# gfpgan and basicsrs issue fix
 pip install git+https://github.com/xinntao/BasicSR.git@master
 pip uninstall gfpgan -y
 pip install git+https://github.com/TencentARC/GFPGAN.git@master
 ```
 
-**Run:** If you don't have a GPU, you can run Deep-Live-Cam using `python run.py`. Note that initial execution will download models (~300MB).
+---
 
-### GPU Acceleration
+### 4. Models Setup
 
-**CUDA Execution Provider (Nvidia)**
+1.  Download [GFPGANv1.4](https://huggingface.co/hacksider/deep-live-cam/resolve/main/GFPGANv1.4.onnx) and place it in the `models/` directory.
+2.  **Auto-downloading swappers**: All other swapping models (e.g. `simswap_256.onnx`, `hififace_unofficial_256.onnx`, `hyperswap_1a_256.onnx`) and their corresponding embedding converters (`crossface_*.onnx`) are automatically downloaded from Hugging Face on the first run of the application when selected.
 
-1. Install [CUDA Toolkit 12.8.0](https://developer.nvidia.com/cuda-12-8-0-download-archive)
-2. Install [cuDNN v8.9.7 for CUDA 12.x](https://developer.nvidia.com/rdp/cudnn-archive) (required for onnxruntime-gpu):
-   - Download cuDNN v8.9.7 for CUDA 12.x
-   - Make sure the cuDNN bin directory is in your system PATH
-3. Install dependencies:
+For details on the swapper models, see [DOCS_MODELS.md](file:///Users/barteq/repos/ai/Deep-Live-Cam/DOCS_MODELS.md).
 
-```bash
-pip install -U torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-pip uninstall onnxruntime onnxruntime-gpu
-pip install onnxruntime-gpu==1.21.0
-```
+---
 
-3. Usage:
+### 5. Configure GPU Acceleration & CoreML
 
-```bash
-python run.py --execution-provider cuda
-```
+Choose the acceleration provider matching your hardware:
 
-**CoreML Execution Provider (Apple Silicon)**
+#### 🍏 Apple Silicon (M1/M2/M3/M4) — CoreML (Neural Engine)
 
-Apple Silicon (M1/M2/M3) specific installation:
+1.  Ensure you are using Python 3.11 and have installed the `python-tk@3.11` package for GUI:
+    ```bash
+    brew install python-tk@3.11
+    ```
+2.  Install CoreML optimized packages:
+    ```bash
+    pip uninstall onnxruntime onnxruntime-silicon
+    pip install onnxruntime-silicon==1.16.3
+    ```
+3.  Run the application:
+    ```bash
+    python run.py --execution-provider coreml
+    ```
 
-1. Make sure you've completed the macOS setup above using Python 3.11.
-2. Install dependencies:
+#### 🟢 Nvidia — CUDA Acceleration
 
-```bash
-pip uninstall onnxruntime onnxruntime-silicon
-pip install onnxruntime-silicon==1.13.1
-```
+1.  Install [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-toolkit) and [cuDNN v8.9+](https://developer.nvidia.com/cudnn).
+2.  Install CUDA-accelerated ONNX runtime:
+    ```bash
+    pip uninstall onnxruntime onnxruntime-gpu
+    pip install onnxruntime-gpu==1.23.2
+    ```
+3.  Run the application:
+    ```bash
+    python run.py --execution-provider cuda
+    ```
 
-3. Usage:
+#### 🔵 Windows — DirectML Acceleration (AMD/Intel/Nvidia)
 
-```bash
-python3.11 run.py --execution-provider coreml
-```
+1.  Install DirectML ONNX runtime:
+    ```bash
+    pip uninstall onnxruntime onnxruntime-directml
+    pip install onnxruntime-directml==1.21.0
+    ```
+2.  Run the application:
+    ```bash
+    python run.py --execution-provider directml
+    ```
 
-**Important Notes for macOS:**
-- You **must** use Python 3.11, not newer versions like 3.13
-- Always run with `python3.11` command not just `python` if you have multiple Python versions installed
-- If you get error about `_tkinter` missing, reinstall the tkinter package: `brew reinstall python-tk@3.11`
-- If you get model loading errors, check that your models are in the correct folder
-- If you encounter conflicts with other Python versions, consider uninstalling them:
-  ```bash
-  # List all installed Python versions
-  brew list | grep python
-
-  # Uninstall conflicting versions if needed
-  brew uninstall --ignore-dependencies python@3.13
-
-  # Keep only Python 3.11
-  brew cleanup
-  ```
-
-**CoreML Execution Provider (Apple Legacy)**
-
-1. Install dependencies:
-
-```bash
-pip uninstall onnxruntime onnxruntime-coreml
-pip install onnxruntime-coreml==1.21.0
-```
-
-2. Usage:
-
-```bash
-python run.py --execution-provider coreml
-```
-
-**DirectML Execution Provider (Windows)**
-
-1. Install dependencies:
-
-```bash
-pip uninstall onnxruntime onnxruntime-directml
-pip install onnxruntime-directml==1.21.0
-```
-
-2. Usage:
-
-```bash
-python run.py --execution-provider directml
-```
-
-**OpenVINO™ Execution Provider (Intel)**
-
-1. Install dependencies:
-
-```bash
-pip uninstall onnxruntime onnxruntime-openvino
-pip install onnxruntime-openvino==1.21.0
-```
-
-2. Usage:
-
-```bash
-python run.py --execution-provider openvino
-```
 </details>
 
 ## Usage
