@@ -269,10 +269,15 @@ options:
   --many-faces                                             process every face
   --map-faces                                              map source target faces
   --mouth-mask                                             mask the mouth region
+  --swapper-model {inswapper,hififace,simswap,hyperswap}   select face swapper model (default: inswapper)
   --video-encoder {libx264,libx265,libvpx-vp9}             adjust output video encoder
   --video-quality [0-51]                                   adjust output video quality
   --live-mirror                                            the live camera display as you see it in the front-facing camera frame
   --live-resizable                                         the live camera frame is resizable
+  --stream-udp STREAM_UDP                                  stream live output over UDP (e.g. 127.0.0.1:5000 or 5000)
+  --disable-interpolation                                  disable temporal frame interpolation/smoothing
+  --interpolation-weight INTERPOLATION_WEIGHT              blend weight for current frame in temporal smoothing (0.0-1.0)
+  --sharpness SHARPNESS                                    sharpness enhancement factor for swapped face (0.0-1.0+)
   --max-memory MAX_MEMORY                                  maximum amount of RAM in GB
   --execution-provider {cpu} [{cpu} ...]                   available execution provider (choices: cpu, ...)
   --execution-threads EXECUTION_THREADS                    number of execution threads
