@@ -122,24 +122,38 @@ def save_switch_states():
 
 
 def load_switch_states():
+    import sys
     try:
         with open("switch_states.json", "r") as f:
             switch_states = json.load(f)
-        modules.globals.keep_fps = switch_states.get("keep_fps", True)
-        modules.globals.keep_audio = switch_states.get("keep_audio", True)
-        modules.globals.keep_frames = switch_states.get("keep_frames", False)
-        modules.globals.many_faces = switch_states.get("many_faces", False)
-        modules.globals.map_faces = switch_states.get("map_faces", False)
+        
+        cli_args = sys.argv
+        if not any(arg in cli_args for arg in ["--keep-fps"]):
+            modules.globals.keep_fps = switch_states.get("keep_fps", True)
+        if not any(arg in cli_args for arg in ["--keep-audio"]):
+            modules.globals.keep_audio = switch_states.get("keep_audio", True)
+        if not any(arg in cli_args for arg in ["--keep-frames"]):
+            modules.globals.keep_frames = switch_states.get("keep_frames", False)
+        if not any(arg in cli_args for arg in ["--many-faces"]):
+            modules.globals.many_faces = switch_states.get("many_faces", False)
+        if not any(arg in cli_args for arg in ["--map-faces"]):
+            modules.globals.map_faces = switch_states.get("map_faces", False)
         modules.globals.poisson_blend = switch_states.get("poisson_blend", False)
         modules.globals.color_correction = switch_states.get("color_correction", False)
-        modules.globals.nsfw_filter = switch_states.get("nsfw_filter", False)
-        modules.globals.live_mirror = switch_states.get("live_mirror", False)
-        modules.globals.live_resizable = switch_states.get("live_resizable", False)
-        modules.globals.fp_ui = switch_states.get("fp_ui", {"face_enhancer": False})
+        if not any(arg in cli_args for arg in ["--nsfw-filter"]):
+            modules.globals.nsfw_filter = switch_states.get("nsfw_filter", False)
+        if not any(arg in cli_args for arg in ["--live-mirror"]):
+            modules.globals.live_mirror = switch_states.get("live_mirror", False)
+        if not any(arg in cli_args for arg in ["--live-resizable"]):
+            modules.globals.live_resizable = switch_states.get("live_resizable", False)
+        if not any(arg in cli_args for arg in ["--frame-processor"]):
+            modules.globals.fp_ui = switch_states.get("fp_ui", {"face_enhancer": False})
         modules.globals.show_fps = switch_states.get("show_fps", False)
-        modules.globals.mouth_mask = switch_states.get("mouth_mask", False)
+        if not any(arg in cli_args for arg in ["--mouth-mask"]):
+            modules.globals.mouth_mask = switch_states.get("mouth_mask", False)
         modules.globals.show_mouth_mask_box = False
-        modules.globals.swapper_model = switch_states.get("swapper_model", "inswapper")
+        if not any(arg in cli_args for arg in ["--swapper-model"]):
+            modules.globals.swapper_model = switch_states.get("swapper_model", "inswapper")
     except FileNotFoundError:
         # If the file doesn't exist, use default values
         pass
