@@ -64,6 +64,12 @@ def parse_args() -> None:
     program.add_argument('--sharpness', help='sharpness enhancement factor for swapped face (0.0-1.0+)', dest='sharpness', type=float, default=0.15)
     program.add_argument('--chin-blend-weight', help='blend weight for custom chin/jawline mask enhancement (0.0-1.0)', dest='chin_blend_weight', type=float, default=0.5)
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
+    # Dual session measured in-pipeline: 14.2 -> 18.3-18.9 FPS (+29%) on M4 Pro
+    # (raw swaps/s underestimates it: the GPU session absorbs frames while the
+    # ANE worker's CPU post-work holds the GIL). Default ON; disable with
+    # --no-dual-session if VRAM/visual issues appear.
+    program.add_argument('--dual-session', help='second ONNX session on GPU alongside ANE for hyperswap live (default on)', dest='dual_session', action='store_true', default=True)
+    program.add_argument('--no-dual-session', help='disable the second GPU session for hyperswap live', dest='dual_session', action='store_false')
     program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=[suggest_default_execution_provider()], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
     program.add_argument('-v', '--version', action='version', version=f'{modules.metadata.name} {modules.metadata.version}')
@@ -99,6 +105,7 @@ def parse_args() -> None:
     modules.globals.interpolation_weight = args.interpolation_weight
     modules.globals.chin_blend_weight = args.chin_blend_weight
     modules.globals.sharpness = args.sharpness
+    modules.globals.dual_session = args.dual_session
     modules.globals.max_memory = args.max_memory
     modules.globals.execution_providers = decode_execution_providers(args.execution_provider)
     modules.globals.execution_threads = args.execution_threads

@@ -1,5 +1,15 @@
 # TODO: Dual-session pipelined live swap (branch `feat/dual-session-pipeline`)
 
+> **STATUS 2026-07-10 (po implementacji Fazy 1+2):** Faza 1 zrobiona i zweryfikowana
+> (pool w ui.py + bench_live --pool). Zmierzone: serial 14.2 FPS, pool ANE-only
+> 14.75 (+4% — GIL ogranicza, patrz 3.2), **pool dual ANE+GPU 18.3-18.9 FPS (+29%)**.
+> WAŻNA KOREKTA: raw bench (bench_dual_session, +11-17%) ZANIŻA zysk dualu w
+> pipeline — druga sesja GPU absorbuje klatki, gdy CPU-work workera ANE trzyma GIL.
+> Dlatego `dual_session` jest default **True** (bramka 2.2 spełniona: 18.3 ≥ 16).
+> Zostało: 2.3 (wizualna kontrola migotania ANE/GPU — wymaga kamery, PSNR 57 dB
+> sugeruje OK), 2.4 (15-min soak: RSS + thermal), Faza 3 opcjonalna (3.2 GIL
+> relief może podnieść ANE-only pool i dual jeszcze wyżej).
+
 > Handoff-ready plan. Wszystkie liczby zmierzone na M4 Pro, macOS 26.x, ORT 1.27,
 > model `hyperswap_1b_256.onnx`, klip testowy 960x540. Assety testowe robisz tak:
 > `ffmpeg -i media/ludwig.gif -frames:v 1 /tmp/source_face.jpg` oraz

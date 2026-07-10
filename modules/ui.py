@@ -320,6 +320,11 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
 
     def destroy_and_reload_model(new_model: str, restart_live: bool = False):
         safe_update_status("Destroying model session...")
+        # Stop swapper pool if active
+        pool_ref = modules.globals.swapper_pool
+        if pool_ref is not None:
+            pool_ref.stop()
+            modules.globals.swapper_pool = None
         import modules.processors.frame.face_swapper as face_swapper
         face_swapper.clear_face_swapper()
 
@@ -1084,8 +1089,20 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
     when the output queue is full so the UI always gets the latest result.
 
     Uses DETECT_EVERY_N to skip expensive face detection on intermediate
-    frames, reusing cached face positions instead."""
+    frames, reusing cached face positions instead.
+
+    When hyperswap is active (no map_faces, no many_faces) the swapper runs
+    through SwapperPool (submit/collect pipeline) so that inference overlaps
+    with detection/post-processing of the next frame — the main FPS gain
+    expected from the dual-session pipeline (Faza 1, TODO.md).
+    """
     frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
+    # Find the face_swapper module for apply_post_processing.
+    fs_mod = next((fp for fp in frame_processors
+                   if fp.NAME == "DLC.FACE-SWAPPER"), None)
+    # Find face_enhancer module for drain-time enhancement.
+    enh_mod = next((fp for fp in frame_processors
+                    if fp.NAME == "DLC.FACE-ENHANCER"), None)
     source_image = None
     prev_time = time.time()
     fps_update_interval = 0.5
@@ -1095,8 +1112,78 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
     proc_frame_index = 0
     cached_target_face = None  # cached single-face result
     cached_many_faces = None   # cached many-faces result
+    pool = None
+
+    def _use_pool() -> bool:
+        """Pool can be used only for hyperswap single-face fast path."""
+        m = modules.globals.swapper_model
+        return (m.startswith("hyperswap")
+                and not modules.globals.map_faces
+                and not modules.globals.many_faces)
+
+    def _ensure_pool():
+        nonlocal pool
+        if pool is not None:
+            return
+        from modules.swapper_pool import SwapperPool
+        from modules.processors.frame.face_swapper import get_model_name, models_dir
+        model_path = os.path.join(models_dir, get_model_name())
+        pool = SwapperPool(
+            model_path,
+            use_gpu_session=modules.globals.dual_session,
+            max_in_flight=3,
+        )
+        pool.start()
+        modules.globals.swapper_pool = pool
+
+    def _push_processed(frame):
+        """Put frame into processed_queue with drop-oldest semantics."""
+        nonlocal frame_count, fps, prev_time
+        current_time = time.time()
+        frame_count += 1
+        if current_time - prev_time >= fps_update_interval:
+            fps = frame_count / (current_time - prev_time)
+            frame_count = 0
+            prev_time = current_time
+
+        if modules.globals.show_fps:
+            cv2.putText(
+                frame,
+                f"FPS: {fps:.1f}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (0, 255, 0),
+                2,
+            )
+        try:
+            processed_queue.put_nowait(frame)
+        except queue.Full:
+            try:
+                processed_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                processed_queue.put_nowait(frame)
+            except queue.Full:
+                pass
 
     while not stop_event.is_set():
+        # --- 1. DRAIN — collect finished pool jobs ---
+        if pool is not None:
+            for _idx, out_frame, bbox, face in pool.collect_ready():
+                # Run enhancer after swap, on the collected frame
+                detected = [face] if (face is not None and enh_mod is not None
+                                      and modules.globals.fp_ui.get("face_enhancer", False)) else []
+                if detected and enh_mod is not None:
+                    out_frame = enh_mod.process_frame(None, out_frame, detected_faces=detected)
+                # Post-processing (sharpening, interpolation)
+                if fs_mod is not None:
+                    bboxes = [bbox] if bbox is not None else []
+                    out_frame = fs_mod.apply_post_processing(out_frame, bboxes)
+                _push_processed(out_frame)
+
+        # --- 2. CAPTURE ---
         try:
             frame = capture_queue.get(timeout=0.05)
         except queue.Empty:
@@ -1104,33 +1191,26 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
 
         temp_frame = frame.copy()
         proc_frame_index += 1
-        # Run full face detection only every Nth frame; use tracker on others
-        DETECT_EVERY_N = 3
-        run_detection = (proc_frame_index % DETECT_EVERY_N == 1) or (cached_target_face is None and cached_many_faces is None)
+        run_detection = (proc_frame_index % DETECT_EVERY_N == 1) or \
+            (cached_target_face is None and cached_many_faces is None)
 
         if modules.globals.live_mirror:
             temp_frame = gpu_flip(temp_frame, 1)
 
+        # --- 3. DETECTION / TRACKING (shared, always sequential) ---
+        have_targets = False
         if not modules.globals.map_faces:
             if source_image is None and modules.globals.source_path:
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
 
-            # Update face detection cache using FaceTracker
-            if run_detection or (cached_target_face is None and cached_many_faces is None):
+            if run_detection:
                 if modules.globals.many_faces:
                     raw_faces = get_many_faces(temp_frame) or []
                     cached_many_faces = tracker.update(temp_frame, raw_faces)
                     cached_target_face = None
                 else:
-                    # Detection-only fast path: the swap needs the target's
-                    # bbox+kps only; the ArcFace recognition embedding computed
-                    # by get_one_face() is never used for the live target.
                     raw_face = detect_one_face_fast(temp_frame)
                     raw_faces = [raw_face] if raw_face is not None else []
-                    # Mouth masking needs 106-point landmarks, which the
-                    # detection-only fast path skips. Add them on detection
-                    # frames only (~1ms/face); the tracker clones them and
-                    # shifts them by optical-flow displacement in between.
                     if modules.globals.mouth_mask and raw_faces:
                         ensure_landmarks(temp_frame, raw_faces)
                     tracked_faces = tracker.update(temp_frame, raw_faces)
@@ -1145,74 +1225,63 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                     cached_target_face = tracked_faces[0] if tracked_faces else None
                     cached_many_faces = None
 
-            for frame_processor in frame_processors:
-                if frame_processor.NAME == "DLC.FACE-ENHANCER":
-                    if modules.globals.fp_ui["face_enhancer"]:
-                        detected_faces = (
-                            cached_many_faces if modules.globals.many_faces
-                            else ([cached_target_face] if cached_target_face is not None else [])
-                        )
-                        temp_frame = frame_processor.process_frame(None, temp_frame, detected_faces=detected_faces)
-                elif frame_processor.NAME == "DLC.FACE-SWAPPER":
-                    # Use cached face positions to skip redundant detection
-                    swapped_bboxes = []
-                    if modules.globals.many_faces and cached_many_faces:
-                        for t_face in cached_many_faces:
-                            temp_frame = frame_processor.swap_face(source_image, t_face, temp_frame)
-                            if hasattr(t_face, 'bbox') and t_face.bbox is not None:
-                                swapped_bboxes.append(t_face.bbox.astype(int))
-                    elif cached_target_face is not None:
-                        temp_frame = frame_processor.swap_face(source_image, cached_target_face, temp_frame)
-                        if hasattr(cached_target_face, 'bbox') and cached_target_face.bbox is not None:
-                            swapped_bboxes.append(cached_target_face.bbox.astype(int))
-                    # Apply post-processing (sharpening, interpolation)
-                    temp_frame = frame_processor.apply_post_processing(temp_frame, swapped_bboxes)
-                else:
-                    temp_frame = frame_processor.process_frame(source_image, temp_frame)
+            if cached_target_face is not None or cached_many_faces:
+                have_targets = True
+
+        # --- 4. SWAP (pool vs legacy) ---
+        use_pool = _use_pool()
+        if use_pool:
+            _ensure_pool()
+            if have_targets and not modules.globals.many_faces and cached_target_face is not None:
+                # Submit swap job; if pool full, frame is silently dropped
+                # (the caller will drain on the next loop iteration)
+                pool.try_submit(temp_frame, cached_target_face, source_image)
+            else:
+                # No face or many_faces — passthrough to maintain ordering
+                pool.submit_passthrough(temp_frame, bbox=None, face=cached_target_face)
         else:
-            modules.globals.target_path = None
-            for frame_processor in frame_processors:
-                if frame_processor.NAME == "DLC.FACE-ENHANCER":
-                    if modules.globals.fp_ui["face_enhancer"]:
-                        detected_faces = (
-                            cached_many_faces if modules.globals.many_faces
-                            else ([cached_target_face] if cached_target_face is not None else [])
-                        )
-                        temp_frame = frame_processor.process_frame_v2(temp_frame, detected_faces=detected_faces)
-                else:
-                    temp_frame = frame_processor.process_frame_v2(temp_frame)
+            # --- Legacy path (no pool) ---
+            if modules.globals.map_faces:
+                modules.globals.target_path = None
+                for frame_processor in frame_processors:
+                    if frame_processor.NAME == "DLC.FACE-ENHANCER":
+                        if modules.globals.fp_ui.get("face_enhancer", False):
+                            detected_faces = (
+                                cached_many_faces if modules.globals.many_faces
+                                else ([cached_target_face] if cached_target_face is not None else [])
+                            )
+                            temp_frame = frame_processor.process_frame_v2(temp_frame, detected_faces=detected_faces)
+                    else:
+                        temp_frame = frame_processor.process_frame_v2(temp_frame)
+            else:
+                for frame_processor in frame_processors:
+                    if frame_processor.NAME == "DLC.FACE-ENHANCER":
+                        if modules.globals.fp_ui.get("face_enhancer", False):
+                            detected_faces = (
+                                cached_many_faces if modules.globals.many_faces
+                                else ([cached_target_face] if cached_target_face is not None else [])
+                            )
+                            temp_frame = frame_processor.process_frame(None, temp_frame, detected_faces=detected_faces)
+                    elif frame_processor.NAME == "DLC.FACE-SWAPPER":
+                        swapped_bboxes = []
+                        if modules.globals.many_faces and cached_many_faces:
+                            for t_face in cached_many_faces:
+                                temp_frame = frame_processor.swap_face(source_image, t_face, temp_frame)
+                                if hasattr(t_face, 'bbox') and t_face.bbox is not None:
+                                    swapped_bboxes.append(t_face.bbox.astype(int))
+                        elif cached_target_face is not None:
+                            temp_frame = frame_processor.swap_face(source_image, cached_target_face, temp_frame)
+                            if hasattr(cached_target_face, 'bbox') and cached_target_face.bbox is not None:
+                                swapped_bboxes.append(cached_target_face.bbox.astype(int))
+                        temp_frame = frame_processor.apply_post_processing(temp_frame, swapped_bboxes)
+                    else:
+                        temp_frame = frame_processor.process_frame(source_image, temp_frame)
 
-        # Calculate and display FPS
-        current_time = time.time()
-        frame_count += 1
-        if current_time - prev_time >= fps_update_interval:
-            fps = frame_count / (current_time - prev_time)
-            frame_count = 0
-            prev_time = current_time
+            # Legacy path also handles FPS and push inline
+            _push_processed(temp_frame)
 
-        if modules.globals.show_fps:
-            cv2.putText(
-                temp_frame,
-                f"FPS: {fps:.1f}",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 255, 0),
-                2,
-            )
-
-        # Put processed frame into output queue, dropping old frames if full
-        try:
-            processed_queue.put_nowait(temp_frame)
-        except queue.Full:
-            try:
-                processed_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
-                processed_queue.put_nowait(temp_frame)
-            except queue.Full:
-                pass
+        # Legacy path does its own push above; pool path pushes in the drain.
+        # After either path, loop back.
 
 
 def create_webcam_preview(camera_index: int):
@@ -1294,6 +1363,11 @@ def create_webcam_preview(camera_index: int):
     WEBCAM_STOP_EVENT = None
     cap_thread.join(timeout=2.0)
     proc_thread.join(timeout=2.0)
+    # Stop the swapper pool if active
+    pool_ref = modules.globals.swapper_pool
+    if pool_ref is not None:
+        pool_ref.stop()
+        modules.globals.swapper_pool = None
     cap.release()
     if streamer is not None:
         streamer.stop()

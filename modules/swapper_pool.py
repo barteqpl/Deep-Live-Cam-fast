@@ -46,6 +46,8 @@ class _Result:
     idx: int
     frame: Any = field(compare=False)
     bbox: Optional[np.ndarray] = field(compare=False, default=None)
+    face: "Optional[Any]" = field(compare=False, default=None)
+    _consumed_sem: bool = field(compare=False, default=True)  # passthrough=False
 
 
 class SwapperPool:
@@ -127,18 +129,38 @@ class SwapperPool:
         self._in_q.put((idx, frame, target_face, source_face))
         return idx
 
+    def submit_passthrough(self, frame: np.ndarray, bbox: Optional[np.ndarray] = None,
+                          face: "Optional[Any]" = None) -> int:
+        """Enqueue a no-op result for frames that need no swap (no face
+        detected, enhancer-only, etc.).  The frame passes through the reorder
+        heap untouched, preserving emit order.
+
+        Returns the assigned sequence index so the caller can correlate.
+        The semaphore is *not* consumed — this is intentionally free.
+        """
+        idx = self._next_submit
+        self._next_submit += 1
+        with self._out_lock:
+            heapq.heappush(self._out_heap, _Result(idx, frame, bbox, face, _consumed_sem=False))
+        return idx
+
     def collect_ready(self) -> Iterator[tuple]:
-        """Yield (idx, frame, bbox) for every finished job that is next in
-        sequence. Non-blocking; yields nothing if the next frame in order
-        is still being processed."""
+        """Yield (idx, frame, bbox, face) for every finished job that is next
+        in sequence.  Non-blocking; yields nothing if the next frame in order
+        is still being processed.
+
+        Only releases the in_flight semaphore for real swap jobs (not
+        passthrough results), so the semaphore stays accurate.
+        """
         while True:
             with self._out_lock:
                 if not self._out_heap or self._out_heap[0].idx != self._next_emit:
                     return
                 res = heapq.heappop(self._out_heap)
                 self._next_emit += 1
-            self._in_flight.release()
-            yield res.idx, res.frame, res.bbox
+            if res._consumed_sem:
+                self._in_flight.release()
+            yield res.idx, res.frame, res.bbox, res.face
 
     def pending(self) -> int:
         """Jobs submitted but not yet emitted (queued + running + reordering)."""
@@ -166,7 +188,7 @@ class SwapperPool:
                 print(f"SwapperPool[{name}]: swap failed on frame {idx}: {e}")
                 out, bbox = frame, None
             with self._out_lock:
-                heapq.heappush(self._out_heap, _Result(idx, out, bbox))
+                heapq.heappush(self._out_heap, _Result(idx, out, bbox, target_face, _consumed_sem=True))
 
 
 __all__ = ["SwapperPool", "BASE_COREML_CFG"]

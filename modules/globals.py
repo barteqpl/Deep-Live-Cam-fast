@@ -1,7 +1,5 @@
-# --- START OF FILE globals.py ---
-
 import os
-from typing import List, Dict, Any
+from typing import Any, List, Dict
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKFLOW_DIR = os.path.join(ROOT_DIR, "workflow")
@@ -77,7 +75,8 @@ mouth_mask_size: float = 0.0       # Mouth mask size (0-100; 0=off, 100=mouth to
 enable_interpolation: bool = True # Toggle temporal smoothing
 interpolation_weight: float = 0  # Blend weight for current frame (0.0-1.0). Lower=smoother.
 chin_blend_weight: float = 0.5   # Strength of custom chin mask blending (0.0-1.0)
-# --- END: Added for Frame Interpolation ---
+dual_session: bool = True        # Druga sesja ONNX na GPU obok ANE (hyperswap live): +29% FPS zmierzone
+swapper_pool: "Any | None" = None  # Referencja do SwapperPool (dla stop z UI, unika circular import)
 
 # --- END OF FILE globals.py ---
 

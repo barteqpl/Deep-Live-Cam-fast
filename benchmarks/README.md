@@ -86,6 +86,23 @@ Findings:
 - Mouth masking costs ~1.4% FPS (landmark model +3.7 ms on detection frames
   only, every `DETECT_EVERY_N`), and only when the switch is on.
 
+## Pipelined pool results (`--pool`, branch feat/dual-session-pipeline)
+
+Same clip and harness as the table above (`bench_live.py --frames 60-90`):
+
+| Config | Pipeline FPS |
+|---|---|
+| hyperswap-1b serial (baseline) | 14.2 |
+| hyperswap-1b `--pool` (ANE only) | 14.75 (+4% — GIL-bound) |
+| hyperswap-1b `--pool --dual-session` | **18.3-18.9 (+29%)** |
+| + `--mouth-mask` | 17.4 |
+| simswap serial (regression check) | 32.1 (unchanged) |
+
+Raw swaps/s (bench_dual_session.py: +11-17%) UNDERSTATES the in-pipeline
+dual gain: the GPU session keeps swapping while the ANE worker's per-frame
+CPU work (align/color/paste) holds the GIL. `dual_session` defaults to True
+for hyperswap live; `--no-dual-session` disables.
+
 ## Historical results (inswapper_128 optimization arc)
 
 | Configuration | Inference | Pipeline FPS |
