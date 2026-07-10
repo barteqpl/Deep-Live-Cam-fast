@@ -402,9 +402,10 @@ def get_model_name() -> str:
         return "simswap_256.onnx"
     elif swapper_model == "hyperswap":
         return "hyperswap_1a_256.onnx"
-    # Use FP32 model on Apple Silicon with CoreML because FP16 has extreme partitioning overhead in CoreML EP
-    if IS_APPLE_SILICON and modules.globals.execution_providers and "CoreMLExecutionProvider" in modules.globals.execution_providers:
-        return "inswapper_128.onnx"
+    # FP16 halves weight memory traffic (264 MB vs 528 MB per inference) — the
+    # win on unified-memory Apple Silicon. Requires onnxruntime >= 1.26: older
+    # CoreML EPs shattered the fp16 graph into 30+ partitions (34/301 nodes
+    # supported -> 668 ms/run); 1.27 runs it as a single partition at ~37 ms.
     return "inswapper_128_fp16.onnx"
 
 
@@ -487,18 +488,38 @@ def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
         return bgr_fake, M
         
     IM = cv2.invertAffineTransform(M)
-    bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
-    
-    # Paste back using pre-computed crop mask to avoid slow full-frame processing
+
+    # The mask is zero outside the warped 128x128 crop, so warping and blending
+    # only need to touch the ROI that crop maps to — not the whole frame.
+    # Full-frame float32 blend costs ~5-6 memory passes over the frame; the ROI
+    # is typically ~5% of it (memory-bandwidth win on unified-memory Macs).
     size = aimg.shape[0]
+    corners = np.array([[0, 0], [size, 0], [size, size], [0, size]], dtype=np.float32)
+    warped_corners = corners @ IM[:, :2].T + IM[:, 2]
+    x0 = max(int(np.floor(warped_corners[:, 0].min())) - 1, 0)
+    y0 = max(int(np.floor(warped_corners[:, 1].min())) - 1, 0)
+    x1 = min(int(np.ceil(warped_corners[:, 0].max())) + 1, img.shape[1])
+    y1 = min(int(np.ceil(warped_corners[:, 1].max())) + 1, img.shape[0])
+    if x1 <= x0 or y1 <= y0:
+        return img.copy()
+
+    IM_roi = IM.copy()
+    IM_roi[0, 2] -= x0
+    IM_roi[1, 2] -= y0
+    roi_size = (x1 - x0, y1 - y0)
+    bgr_fake_warped = cv2.warpAffine(bgr_fake, IM_roi, roi_size, flags=cv2.INTER_CUBIC, borderValue=0.0)
+
     crop_mask = get_crop_mask(size) / 255.0
     crop_mask = apply_chin_blend_to_mask(crop_mask, size)
     crop_mask = crop_mask * get_margin_mask(size)
-    img_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
-    img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
-    
-    fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)
-    return fake_merged.astype(np.uint8)
+    img_mask = cv2.warpAffine(crop_mask, IM_roi, roi_size, borderValue=0.0)
+    img_mask = img_mask[:, :, None]
+
+    out = img.copy()
+    roi = out[y0:y1, x0:x1]
+    merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * roi.astype(np.float32)
+    roi[:] = merged.astype(np.uint8)
+    return out
 
 
 def clear_face_swapper() -> None:
@@ -527,7 +548,9 @@ def get_face_swapper() -> Any:
                                 "ModelFormat": "MLProgram",
                                 "MLComputeUnits": "CPUAndGPU",
                                 "SpecializationStrategy": "FastPrediction",
-                                "AllowLowPrecisionAccumulationOnGPU": 0,
+                                # fp16 accumulation on GPU: measured no quality
+                                # loss (PSNR 60 dB vs fp32) and lower latency
+                                "AllowLowPrecisionAccumulationOnGPU": 1,
                                 "EnableOnSubgraphs": 1,
                             }
                         ))
@@ -614,7 +637,11 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
 
         # Explicitly clip values to 0-255 and convert to uint8
         # This handles cases where the model might output floats or values outside the valid range
-        swapped_frame = np.clip(swapped_frame_raw, 0, 255).astype(np.uint8)
+        # (skipped when already uint8 — clip+astype would be two wasted full-frame passes)
+        if swapped_frame_raw.dtype == np.uint8:
+            swapped_frame = swapped_frame_raw
+        else:
+            swapped_frame = np.clip(swapped_frame_raw, 0, 255).astype(np.uint8)
         # --- END: CRITICAL FIX FOR ORT 1.17 ---
 
     except Exception as e:
@@ -691,7 +718,9 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
     """Applies sharpening and interpolation with Apple Silicon optimizations."""
     global PREVIOUS_FRAME_RESULT
 
-    processed_frame = current_frame.copy()
+    # Sharpening only rewrites face-bbox regions and every caller reassigns the
+    # returned frame, so working in place avoids a full-frame copy per frame.
+    processed_frame = current_frame
 
     # 1. Apply Sharpening (if enabled) with optimized kernel for Apple Silicon
     sharpness_value = getattr(modules.globals, "sharpness", 0.0)
@@ -759,10 +788,10 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
                 pass
             PREVIOUS_FRAME_RESULT = processed_frame.copy()
     else:
-         # If interpolation is off or weight is invalid, just use the current frame
-         # Update state with the current (potentially sharpened) frame
-         # Reset previous frame state if interpolation was just turned off or weight is invalid
-         PREVIOUS_FRAME_RESULT = processed_frame.copy()
+         # Interpolation off: no temporal state is needed. Dropping it (instead
+         # of storing a full-frame copy every frame) also guarantees a clean
+         # restart when interpolation gets re-enabled.
+         PREVIOUS_FRAME_RESULT = None
 
 
     return final_frame
