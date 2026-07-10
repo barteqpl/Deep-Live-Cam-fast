@@ -389,6 +389,10 @@ class HyperSwapSwapper:
         self.template = 'arcface_128'
         self.mean = np.array([0.5, 0.5, 0.5], dtype=np.float32)
         self.std = np.array([0.5, 0.5, 0.5], dtype=np.float32)
+        # Per-instance lock (not the module-global THREAD_LOCK): SwapperPool
+        # runs several HyperSwapSwapper instances concurrently on different
+        # compute units; a shared lock would serialize them to zero gain.
+        self.lock = threading.Lock()
 
     def get(self, img, target_face, source_face, paste_back=True):
         # 1. Align face using FaceFusion's arcface_128 template
@@ -404,7 +408,7 @@ class HyperSwapSwapper:
         latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
 
         # 4. Inference - HyperSwap input order: source=embedding, target=image
-        with THREAD_LOCK:
+        with self.lock:
             pred = self.session.run(self.output_names, {'source': latent, 'target': blob})
         pred_img = pred[0]
         pred_mask = pred[1]  # HyperSwap outputs a mask [1, 1, 256, 256]
@@ -625,9 +629,15 @@ def get_face_swapper() -> Any:
     return FACE_SWAPPER
 
 
-def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
-    """Optimized face swapping with better memory management and performance."""
-    face_swapper = get_face_swapper()
+def swap_face(source_face: Face, target_face: Face, temp_frame: Frame,
+              swapper: Any = None) -> Frame:
+    """Optimized face swapping with better memory management and performance.
+
+    ``swapper`` overrides the module singleton — used by
+    modules/swapper_pool.py to run several sessions concurrently while
+    keeping all post-swap features (mouth mask, poisson, opacity) intact.
+    """
+    face_swapper = swapper if swapper is not None else get_face_swapper()
     if face_swapper is None:
         update_status("Face swapper model not loaded or failed to load. Skipping swap.", NAME)
         return temp_frame
