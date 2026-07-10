@@ -14,6 +14,7 @@ import modules.metadata
 from modules.face_analyser import (
     get_one_face,
     detect_one_face_fast,
+    ensure_landmarks,
     get_many_faces,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
@@ -363,7 +364,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     model_optionmenu = ctk.CTkOptionMenu(
         root,
         variable=model_variable,
-        values=["inswapper", "hififace", "simswap", "hyperswap"],
+        values=["inswapper", "hififace", "simswap", "hyperswap", "hyperswap-1b"],
         command=on_model_change,
     )
     model_optionmenu.place(relx=0.74, rely=0.545, relwidth=0.21, relheight=0.04)
@@ -1126,6 +1127,12 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                     # by get_one_face() is never used for the live target.
                     raw_face = detect_one_face_fast(temp_frame)
                     raw_faces = [raw_face] if raw_face is not None else []
+                    # Mouth masking needs 106-point landmarks, which the
+                    # detection-only fast path skips. Add them on detection
+                    # frames only (~1ms/face); the tracker clones them and
+                    # shifts them by optical-flow displacement in between.
+                    if modules.globals.mouth_mask and raw_faces:
+                        ensure_landmarks(temp_frame, raw_faces)
                     tracked_faces = tracker.update(temp_frame, raw_faces)
                     cached_target_face = tracked_faces[0] if tracked_faces else None
                     cached_many_faces = None

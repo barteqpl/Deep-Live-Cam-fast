@@ -460,6 +460,10 @@ def get_model_name() -> str:
         return "simswap_256.onnx"
     elif swapper_model == "hyperswap":
         return "hyperswap_1a_256.onnx"
+    elif swapper_model == "hyperswap-1b":
+        # Same architecture as 1a; measured ~10% faster on ANE (70 vs 78
+        # ms/run, M4 Pro) and a newer FaceFusion training checkpoint.
+        return "hyperswap_1b_256.onnx"
     # FP16 halves weight memory traffic (264 MB vs 528 MB per inference) — the
     # win on unified-memory Apple Silicon. Requires onnxruntime >= 1.26: older
     # CoreML EPs shattered the fp16 graph into 30+ partitions (34/301 nodes
@@ -480,6 +484,8 @@ def pre_check() -> bool:
         urls.append("https://huggingface.co/facefusion/models-3.4.0/resolve/main/crossface_simswap.onnx")
     elif model_name == "hyperswap_1a_256.onnx":
         urls.append("https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1a_256.onnx")
+    elif model_name == "hyperswap_1b_256.onnx":
+        urls.append("https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1b_256.onnx")
     elif model_name == "inswapper_128.onnx":
         urls.append("https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx")
     else:
@@ -576,7 +582,7 @@ def get_face_swapper() -> Any:
                 # simswap (21 vs 81 ms) and hififace (46 vs 116 ms) are faster
                 # on GPU. ANE routing also frees the GPU for face detection.
                 compute_units = (
-                    "CPUAndNeuralEngine" if model_name == "hyperswap_1a_256.onnx"
+                    "CPUAndNeuralEngine" if model_name.startswith("hyperswap")
                     else "CPUAndGPU"
                 )
                 providers_config = []
@@ -602,7 +608,7 @@ def get_face_swapper() -> Any:
                     FACE_SWAPPER = HiFiFaceSwapper(model_path, providers=providers_config)
                 elif model_name == "simswap_256.onnx":
                     FACE_SWAPPER = SimSwapSwapper(model_path, providers=providers_config)
-                elif model_name == "hyperswap_1a_256.onnx":
+                elif model_name.startswith("hyperswap"):
                     FACE_SWAPPER = HyperSwapSwapper(model_path, providers=providers_config)
                 else:
                     FACE_SWAPPER = insightface.model_zoo.get_model(

@@ -17,6 +17,7 @@ MODELS = {
     "simswap": ("simswap_256.onnx", {"in": ["input", "latent"]}),
     "hififace": ("hififace_unofficial_256.onnx", {"in": ["input", "latent"]}),
     "hyperswap": ("hyperswap_1a_256.onnx", {"in": ["target", "source"]}),
+    "hyperswap-1b": ("hyperswap_1b_256.onnx", {"in": ["target", "source"]}),
 }
 
 CFG = {

@@ -56,7 +56,12 @@ fp_ui: Dict[str, bool] = {"face_enhancer": False, "face_enhancer_gpen256": False
 
 # Face Swapper Specific Options
 face_swapper_enabled: bool = True # General toggle for the swapper processor
-swapper_model: str = "simswap"  # Model choice: "inswapper", "hififace" or "simswap"
+swapper_model: str = "simswap"  # Model choice: "inswapper", "hififace", "simswap", "hyperswap", "hyperswap-1b"
+
+# Live-preview face enhancer model. GPEN-BFR-256 runs at ~50 ms/frame vs
+# ~108 ms for GFPGAN-512 on M4 Pro (2.2x), at lower restoration quality.
+# File (image/video) processing always uses GFPGAN-512 regardless.
+live_enhancer_model: str = "gpen256"  # "gpen256" | "gfpgan"
 opacity: float = 1.0              # Blend factor for the swapped face (0.0-1.0)
 sharpness: float = 0.15            # Sharpness enhancement for swapped face (0.0-1.0+)
 

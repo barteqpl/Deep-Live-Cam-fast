@@ -211,7 +211,11 @@ def ensure_landmarks(frame: Frame, faces: Any) -> None:
         # so getattr(..., None) is the safe presence check.
         if getattr(face, "landmark_2d_106", None) is None:
             try:
-                lmk_model.get(frame, face)
+                if _is_dml():
+                    with modules.globals.dml_lock:
+                        lmk_model.get(frame, face)
+                else:
+                    lmk_model.get(frame, face)
             except Exception as e:  # pragma: no cover - never break the swap
                 print(f"Error computing 2d106 landmarks: {e}")
 
@@ -277,6 +281,12 @@ class FaceTracker:
                 
                 face.kps = new_kps
                 face.bbox = new_bbox
+                # Keep 106-point landmarks (used by mouth masking) roughly
+                # aligned between detection frames — a rigid shift by the
+                # mean optical-flow displacement is enough for 2-3 frames.
+                lmk = getattr(face, "landmark_2d_106", None)
+                if lmk is not None:
+                    face.landmark_2d_106 = lmk + mean_displacement
                 next_tracked_faces.append(face)
             else:
                 # Tracking lost for this face, drop it

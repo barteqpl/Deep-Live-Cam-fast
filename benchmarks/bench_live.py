@@ -33,7 +33,7 @@ modules.globals.show_fps = False
 modules.globals.live_mirror = False
 modules.globals.frame_processors = ["face_swapper"]
 
-from modules.face_analyser import get_one_face, detect_one_face_fast, FaceTracker  # noqa: E402
+from modules.face_analyser import get_one_face, detect_one_face_fast, ensure_landmarks, FaceTracker  # noqa: E402
 from modules.processors.frame import face_swapper as fs  # noqa: E402
 
 # Headless: update_status tries to touch the Tk status label
@@ -53,13 +53,25 @@ def main():
     ap.add_argument("--detect-every", type=int, default=DETECT_EVERY_N)
     ap.add_argument("--save-frame", default=None, help="save processed frame #30 as PNG")
     ap.add_argument("--sharpness", type=float, default=None)
-    ap.add_argument("--model", default=None, help="swapper model: inswapper|simswap|hififace|hyperswap")
+    ap.add_argument("--model", default=None, help="swapper model: inswapper|simswap|hififace|hyperswap|hyperswap-1b")
+    ap.add_argument("--enhancer", default=None, choices=["gfpgan", "gpen256"],
+                    help="also run the live face enhancer per frame")
+    ap.add_argument("--mouth-mask", action="store_true",
+                    help="enable mouth masking (mirrors the ui.py live path)")
     args = ap.parse_args()
 
     if args.sharpness is not None:
         modules.globals.sharpness = args.sharpness
     if args.model:
         modules.globals.swapper_model = args.model
+    if args.mouth_mask:
+        modules.globals.mouth_mask = True
+
+    enhancer_mod = None
+    if args.enhancer:
+        modules.globals.live_enhancer_model = args.enhancer
+        from modules.processors.frame import face_enhancer as enhancer_mod
+        enhancer_mod.update_status = lambda msg, scope="BENCH": print(f"[{scope}] {msg}")
 
     src_img = cv2.imread(os.path.expanduser(args.source))
     assert src_img is not None, f"cannot read source {args.source}"
@@ -95,7 +107,7 @@ def main():
 
     tracker = FaceTracker()
     cached_target_face = None
-    stages = {k: 0.0 for k in ("copy", "detect", "track", "swap", "post")}
+    stages = {k: 0.0 for k in ("copy", "detect", "track", "swap", "enh", "post")}
     n_detect = 0
     total_t0 = None
     processed = 0
@@ -124,6 +136,8 @@ def main():
             t0 = time.perf_counter()
             raw_face = detect_one_face_fast(temp_frame)  # mirrors ui.py live path
             raw_faces = [raw_face] if raw_face is not None else []
+            if modules.globals.mouth_mask and raw_faces:
+                ensure_landmarks(temp_frame, raw_faces)
             tracked = tracker.update(temp_frame, raw_faces)
             cached_target_face = tracked[0] if tracked else None
             stages["detect"] += time.perf_counter() - t0
@@ -142,6 +156,13 @@ def main():
             if getattr(cached_target_face, "bbox", None) is not None:
                 swapped_bboxes.append(cached_target_face.bbox.astype(int))
 
+        if enhancer_mod is not None and cached_target_face is not None:
+            t0 = time.perf_counter()
+            temp_frame = enhancer_mod.process_frame(
+                None, temp_frame, detected_faces=[cached_target_face]
+            )
+            stages["enh"] += time.perf_counter() - t0
+
         t0 = time.perf_counter()
         temp_frame = fs.apply_post_processing(temp_frame, swapped_bboxes)
         stages["post"] += time.perf_counter() - t0
@@ -159,6 +180,8 @@ def main():
     print(f"detect : {stages['detect']/max(n_detect,1)*1000:7.2f} ms/detect-frame  (x{n_detect})")
     print(f"track  : {stages['track']/max(n_track,1)*1000:7.2f} ms/track-frame   (x{n_track})")
     print(f"swap   : {stages['swap']/n*1000:7.2f} ms/frame  (infer {infer_t[0]/max(infer_t[1],1)*1000:.2f} ms x{infer_t[1]})")
+    if stages["enh"] > 0:
+        print(f"enh    : {stages['enh']/n*1000:7.2f} ms/frame")
     print(f"post   : {stages['post']/n*1000:7.2f} ms/frame")
     accounted = sum(stages.values())
     print(f"accounted: {accounted/n*1000:.2f} ms/frame of {total/n*1000:.2f}")

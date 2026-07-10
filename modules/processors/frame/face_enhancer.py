@@ -305,6 +305,23 @@ def enhance_face(temp_frame: Frame, detected_faces=None) -> Frame:
             Also enables temporal caching — inference runs every
             _ENH_INTERVAL frames, reusing the cached result otherwise.
     """
+    # Live path (pre-detected faces) defaults to GPEN-BFR-256: measured
+    # ~50 ms/frame vs ~108 ms for GFPGAN-512 on M4 Pro. GFPGAN-512 at 6 FPS
+    # dominated the whole live pipeline regardless of swapper model. Checked
+    # before get_face_enhancer() so the 324 MB GFPGAN session is never
+    # loaded when the live preview runs on GPEN.
+    if (detected_faces is not None
+            and getattr(modules.globals, "live_enhancer_model", "gpen256") == "gpen256"):
+        from modules.processors.frame import face_enhancer_gpen256 as gpen256
+        many_faces_mode = getattr(modules.globals, "many_faces", False)
+        for face in detected_faces:
+            if getattr(face, "kps", None) is None:
+                continue
+            temp_frame = gpen256.enhance_face(temp_frame, face)
+            if not many_faces_mode:
+                break
+        return temp_frame
+
     session = get_face_enhancer()
 
     # Determine model input resolution from the session metadata

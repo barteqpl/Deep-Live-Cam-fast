@@ -58,6 +58,34 @@ HyperSwap is the notable case: it is ~3x faster on the Neural Engine, while
 simswap (81 ms) and hififace (116 ms) get *slower* on ANE — compute-unit
 routing is per-model, not global (see `get_face_swapper`).
 
+## HyperSwap 1a vs 1b + enhancer results (M4 Pro, 960x540, gif-derived clip)
+
+Measured with `bench_live.py --frames 60` on a small-face test clip (numbers
+are comparable within this table, not with the table above):
+
+| Config | Pipeline FPS | Swap infer | Enhancer |
+|---|---|---|---|
+| hyperswap (1a) | 13.0 | 63.7 ms | — |
+| hyperswap + mouth mask | 12.8 | 61.8 ms | — |
+| hyperswap-1b | 14.4 | 55.8 ms | — |
+| simswap + GFPGAN-512 | 6.6 | 23.0 ms | 119.2 ms |
+| simswap + GPEN-256 | 12.4 | 22.3 ms | 48.9 ms |
+| hyperswap-1b + GPEN-256 | 8.2 | 52.4 ms | 56.8 ms |
+
+Findings:
+
+- **hyperswap_1b_256** (same architecture, newer FaceFusion checkpoint) runs
+  ~10% faster than 1a on ANE and is exposed as the `hyperswap-1b` model choice.
+- **The face enhancer was the live bottleneck**: GFPGAN-512 costs ~108-119
+  ms/frame on GPU (and 716 ms on ANE — never route it there). The live path
+  now defaults to GPEN-BFR-256 (~50 ms, `--live-enhancer` to override); file
+  processing keeps GFPGAN-512 for quality.
+- Dead ends (measured, don't retry): `optimize_for_coreml` on hyperswap is a
+  no-op; hyperswap weights are already fp16 internally (onnxconverter refuses
+  a second conversion); hyperswap on GPU is ~140 ms (2x slower than ANE).
+- Mouth masking costs ~1.4% FPS (landmark model +3.7 ms on detection frames
+  only, every `DETECT_EVERY_N`), and only when the switch is on.
+
 ## Historical results (inswapper_128 optimization arc)
 
 | Configuration | Inference | Pipeline FPS |
