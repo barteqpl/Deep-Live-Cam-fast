@@ -13,6 +13,7 @@ import modules.globals
 import modules.metadata
 from modules.face_analyser import (
     get_one_face,
+    detect_one_face_fast,
     get_many_faces,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
@@ -1120,7 +1121,10 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                     cached_many_faces = tracker.update(temp_frame, raw_faces)
                     cached_target_face = None
                 else:
-                    raw_face = get_one_face(temp_frame)
+                    # Detection-only fast path: the swap needs the target's
+                    # bbox+kps only; the ArcFace recognition embedding computed
+                    # by get_one_face() is never used for the live target.
+                    raw_face = detect_one_face_fast(temp_frame)
                     raw_faces = [raw_face] if raw_face is not None else []
                     tracked_faces = tracker.update(temp_frame, raw_faces)
                     cached_target_face = tracked_faces[0] if tracked_faces else None
@@ -1256,20 +1260,21 @@ def create_webcam_preview(camera_index: int):
                 streamer.start()
             streamer.write(temp_frame)
 
-        if modules.globals.live_resizable:
-            temp_frame = fit_image_to_size(
-                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
-            )
-        else:
-            temp_frame = fit_image_to_size(
-                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
-            )
+        # Downscale to the preview window size. Both live_resizable branches
+        # were identical, so this is a single unconditional call. Behavior for
+        # the uninitialized window (winfo_width/height == 1) is unchanged: the
+        # call args match the previous code exactly, so fit_image_to_size
+        # handles that boundary case the same way it did before.
+        temp_frame = fit_image_to_size(
+            temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
+        )
 
+        # Color-convert AFTER downscaling so BGR2RGB runs on the smaller buffer.
+        # fit_image_to_size already produced the target size, so the previous
+        # ImageOps.contain() pass resized the image to a size it already had --
+        # a redundant full-frame LANCZOS resample -- and has been removed.
         image = gpu_cvt_color(temp_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(image)
-        image = ImageOps.contain(
-            image, (temp_frame.shape[1], temp_frame.shape[0]), Image.LANCZOS
-        )
         image = ctk.CTkImage(image, size=image.size)
         preview_label.configure(image=image)
         ROOT.update()
