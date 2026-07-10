@@ -394,7 +394,19 @@ class HyperSwapSwapper:
         # compute units; a shared lock would serialize them to zero gain.
         self.lock = threading.Lock()
 
-    def get(self, img, target_face, source_face, paste_back=True):
+    # --- Split get() into three stages for the SwapperPool pipeline (Faza 3.2,
+    # GIL relief). prepare + finalize hold the GIL (numpy/cv2 CPU work) and run
+    # on the MAIN thread; infer() is the ONLY thing pool workers run, and it
+    # releases the GIL inside session.run so inference overlaps with the main
+    # thread's detection/finalization of neighbouring frames. get() keeps the
+    # exact serial behaviour by composing the three stages. ---
+
+    def prepare(self, img, target_face, source_face):
+        """Stage 1 (main thread): align + normalize + build source latent.
+
+        Returns (blob, latent, aimg, M) — everything infer() and finalize()
+        need. No session access, so it is safe to call while a worker runs
+        infer() on the same swapper instance."""
         # 1. Align face using FaceFusion's arcface_128 template
         aimg, M = _warp_face_by_template(img, target_face.kps, self.template, self.input_size)
 
@@ -404,16 +416,24 @@ class HyperSwapSwapper:
         blob = crop_rgb.transpose(2, 0, 1)
         blob = np.expand_dims(blob, axis=0).astype(np.float32)
 
-        # 3. HyperSwap uses normed_embedding directly (no crossface needed)
+        # 3. HyperSwap uses normed_embedding directly (no crossface needed).
+        # The .copy() avoids a CoreML EP crash from caching the memory address
+        # of a reused embedding buffer — do NOT remove it.
         latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+        return blob, latent, aimg, M
 
-        # 4. Inference - HyperSwap input order: source=embedding, target=image
+    def infer(self, blob, latent):
+        """Stage 2 (pool worker): ONNX inference only. session.run releases the
+        GIL, so this is the sole per-frame work handed to pool workers.
+        Returns (pred_img, pred_mask)."""
         with self.lock:
             pred = self.session.run(self.output_names, {'source': latent, 'target': blob})
-        pred_img = pred[0]
-        pred_mask = pred[1]  # HyperSwap outputs a mask [1, 1, 256, 256]
+        return pred[0], pred[1]  # pred_mask is [1, 1, 256, 256]
 
-        # 5. Denormalize: x * std + mean, clip [0,1], convert to BGR uint8
+    def finalize(self, img, pred_img, pred_mask, aimg, M, paste_back=True):
+        """Stage 3 (main thread): denormalize + chin blend + masks +
+        color-match + ROI paste-back. Identical math to the old inline get()."""
+        # Denormalize: x * std + mean, clip [0,1], convert to BGR uint8
         img_fake = pred_img[0].transpose((1, 2, 0))
         img_fake = img_fake * self.std + self.mean
         img_fake = np.clip(img_fake, 0, 1)
@@ -422,7 +442,7 @@ class HyperSwapSwapper:
         if not paste_back:
             return bgr_fake, M
 
-        # 6. Paste back using model's built-in mask (ROI only)
+        # Paste back using model's built-in mask (ROI only)
         IM = cv2.invertAffineTransform(M)
         crop_mask = pred_mask[0, 0]  # [256, 256] float
         crop_mask = apply_chin_blend_to_mask(crop_mask, 256)
@@ -432,6 +452,11 @@ class HyperSwapSwapper:
         crop_mask = crop_mask * get_margin_mask(256)
         bgr_fake = _color_match(bgr_fake, aimg, crop_mask)
         return _paste_back_roi(img, bgr_fake, crop_mask, IM, blur_mask=True)
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        blob, latent, aimg, M = self.prepare(img, target_face, source_face)
+        pred_img, pred_mask = self.infer(blob, latent)
+        return self.finalize(img, pred_img, pred_mask, aimg, M, paste_back=paste_back)
 
 
 FACE_SWAPPER = None
@@ -763,6 +788,61 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame,
                     print(f"Poisson blending failed: {e}")
         
     # Apply opacity blend if we have the original frame
+    if original_frame is not None:
+        final_swapped_frame = gpu_add_weighted(original_frame, 1 - opacity, swapped_frame, opacity, 0)
+        return final_swapped_frame.astype(np.uint8)
+
+    return swapped_frame
+
+
+def finalize_swap(swapper: Any, target_face: Face, temp_frame: Frame,
+                  pred_img: np.ndarray, pred_mask: np.ndarray,
+                  aimg: np.ndarray, M: np.ndarray) -> Frame:
+    """Main-thread finalization for the SwapperPool (Faza 3.2) path.
+
+    Runs everything ``swap_face`` does AFTER inference, but on outputs the pool
+    worker already produced: ``swapper.finalize`` (denorm + paste-back) followed
+    by the same post-swap extras — mouth mask and opacity blend. Poisson blend
+    is intentionally NOT supported here (it needs the pre-swap full frame, which
+    the pool path does not carry); ``_use_pool`` gates poisson_blend out, so this
+    matches the serial path for every pool-eligible configuration.
+
+    Kept in face_swapper.py so ui.py and bench_live can reuse identical math.
+    """
+    if temp_frame.dtype != np.uint8:
+        temp_frame = np.clip(temp_frame, 0, 255).astype(np.uint8)
+
+    opacity = getattr(modules.globals, "opacity", 1.0)
+    opacity = max(0.0, min(1.0, opacity))
+    original_frame = temp_frame.copy() if opacity < 1.0 else None
+
+    try:
+        swapped_frame = swapper.finalize(temp_frame, pred_img, pred_mask, aimg, M, paste_back=True)
+        if not isinstance(swapped_frame, np.ndarray):
+            return original_frame if original_frame is not None else temp_frame
+        if swapped_frame.dtype != np.uint8:
+            swapped_frame = np.clip(swapped_frame, 0, 255).astype(np.uint8)
+    except Exception as e:
+        print(f"Error during finalize_swap: {e}")
+        return original_frame if original_frame is not None else temp_frame
+
+    # Mouth mask (same as swap_face, main thread)
+    if getattr(modules.globals, "mouth_mask", False):
+        face_mask = create_face_mask(target_face, temp_frame)
+        mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon = (
+            create_lower_mouth_mask(target_face, temp_frame)
+        )
+        if mouth_cutout is not None and mouth_box != (0, 0, 0, 0):
+            swapped_frame = apply_mouth_area(
+                swapped_frame, mouth_cutout, mouth_box, face_mask, lower_lip_polygon
+            )
+            if getattr(modules.globals, "show_mouth_mask_box", False):
+                mouth_mask_data = (mouth_mask, mouth_cutout, mouth_box, lower_lip_polygon)
+                swapped_frame = draw_mouth_mask_visualization(
+                    swapped_frame, target_face, mouth_mask_data
+                )
+
+    # Opacity blend
     if original_frame is not None:
         final_swapped_frame = gpu_add_weighted(original_frame, 1 - opacity, swapped_frame, opacity, 0)
         return final_swapped_frame.astype(np.uint8)

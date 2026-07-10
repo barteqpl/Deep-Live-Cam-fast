@@ -30,22 +30,39 @@ fs.update_status = lambda msg, scope="BENCH": print(f"[{scope}] {msg}")
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _finalize(res):
+    """Reproduce the main-thread finalization (Faza 3.2 pool API)."""
+    if res.passthrough or res.pred_img is None:
+        return res.frame
+    return fs.finalize_swap(res.swapper, res.target_face, res.frame,
+                            res.pred_img, res.pred_mask, res.aimg, res.M)
+
+
 def run(jobs, src, model_path, use_gpu, deadline_s=120):
     pool = SwapperPool(model_path, use_gpu_session=use_gpu)
     pool.start()
-    pool.try_submit(jobs[0][0].copy(), jobs[0][1], src)
+    ref = pool.reference_swapper
+
+    def _submit(frame, tface):
+        # prepare() on the caller thread; worker runs infer() only.
+        blob, latent, aimg, M = ref.prepare(frame, tface, src)
+        return pool.try_submit(frame, tface, blob, latent, aimg, M)
+
+    _submit(jobs[0][0].copy(), jobs[0][1])
     deadline = time.time() + deadline_s
     while pool.pending() and time.time() < deadline:  # warmup drain
-        list(pool.collect_ready())
+        for res in pool.collect_ready():
+            _finalize(res)
         time.sleep(0.005)
 
     t0 = time.perf_counter()
     got, i = [], 0
     while len(got) < len(jobs) and time.time() < deadline:
-        if i < len(jobs) and pool.try_submit(jobs[i][0].copy(), jobs[i][1], src) is not None:
+        if i < len(jobs) and _submit(jobs[i][0].copy(), jobs[i][1]) is not None:
             i += 1
-        for idx, out, _bbox in pool.collect_ready():
-            got.append(idx)
+        for res in pool.collect_ready():
+            out = _finalize(res)
+            got.append(res.idx)
             assert out.shape == jobs[0][0].shape, "frame shape changed in pool"
         time.sleep(0.001)
     dt = time.perf_counter() - t0

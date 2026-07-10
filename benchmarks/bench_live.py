@@ -46,6 +46,29 @@ DETECT_EVERY_N = 3
 WARMUP = 6
 
 
+def _pct(vals, p):
+    """Linear-interpolated percentile of `vals` (list of ms). Empty -> 0.0."""
+    if not vals:
+        return 0.0
+    s = sorted(vals)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * p / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
+
+
+def _print_frame_times(intervals):
+    """Pacing is the acceptance criterion, not just average FPS."""
+    if not intervals:
+        return
+    p50, p95, mx = _pct(intervals, 50), _pct(intervals, 95), max(intervals)
+    ratio = p95 / p50 if p50 > 0 else 0.0
+    print(f"frame-time: p50 {p50:6.1f} ms  p95 {p95:6.1f} ms  "
+          f"max {mx:6.1f} ms  (p95/p50 {ratio:.2f}x, n={len(intervals)})")
+
+
 def _run_serial(args, frames, source_face, enhancer_mod):
     """Serial pipeline — baseline."""
     swapper = fs.get_face_swapper()
@@ -69,6 +92,8 @@ def _run_serial(args, frames, source_face, enhancer_mod):
 
     saved = False
     total_t0 = None
+    intervals = []          # per-emitted-frame wall interval (ms), post-warmup
+    last_emit = None
     for i in range(WARMUP + n):
         frame = frames[i % len(frames)]
 
@@ -126,6 +151,12 @@ def _run_serial(args, frames, source_face, enhancer_mod):
             cv2.imwrite(os.path.expanduser(args.save_frame), temp_frame)
             saved = True
 
+        if i >= WARMUP:
+            now = time.perf_counter()
+            if last_emit is not None:
+                intervals.append((now - last_emit) * 1000.0)
+            last_emit = now
+
     total = time.perf_counter() - total_t0
     n = args.frames
     print(f"\n=== bench_live results (serial, {n} frames, warmup {WARMUP}) ===")
@@ -142,10 +173,15 @@ def _run_serial(args, frames, source_face, enhancer_mod):
     if stages["enh"]:
         print(f"enh    : {stages['enh']/n*1000:7.2f} ms/frame")
     print(f"post   : {stages['post']/n*1000:7.2f} ms/frame")
+    _print_frame_times(intervals)
 
 
 def _run_pool(args, frames, source_face, enhancer_mod):
-    """Pipelined submit/collect with SwapperPool."""
+    """Pipelined submit/collect with SwapperPool (Faza 3.2, GIL relief).
+
+    Mirrors ui.py: prepare() (align + latent) runs on THIS thread before submit,
+    the worker runs infer() only, and finalize_swap() + post run here on collect.
+    """
     from modules.swapper_pool import SwapperPool
     modules.globals.dual_session = args.dual_session
     pool = SwapperPool(
@@ -154,28 +190,29 @@ def _run_pool(args, frames, source_face, enhancer_mod):
         max_in_flight=3,
     )
     pool.start()
+    ref = pool.reference_swapper
 
     tracker = FaceTracker()
     cached_target_face = None
-    stages = {k: 0.0 for k in ("detect", "track", "enh", "post")}
-    n_detect = 0
+    stages = {k: 0.0 for k in ("detect", "track", "prep", "final", "enh", "post")}
     n = args.frames
     total_f = n + WARMUP
     saved = False
 
-    # 1. Submit all frames with blocking retry + drain
     submitted = 0
     collected = 0
     total_t0 = None
-    # detection stage timer (aggregated inside the submit loop)
     detect_timer = 0.0
     track_timer = 0.0
     n_detect_total = 0
     n_track_total = 0
+    intervals = []          # per-emitted-frame wall interval (ms), post-warmup
+    last_emit = None
 
-    while submitted < total_f:
-        # Drain first
-        for _idx, out_f, bbox, face in pool.collect_ready():
+    def _drain():
+        nonlocal collected, total_t0, detect_timer, track_timer
+        nonlocal n_detect_total, n_track_total, saved, last_emit
+        for res in pool.collect_ready():
             collected += 1
             if collected == WARMUP + 1 and total_t0 is None:
                 total_t0 = time.perf_counter()
@@ -185,20 +222,40 @@ def _run_pool(args, frames, source_face, enhancer_mod):
                 track_timer = 0.0
                 n_detect_total = 0
                 n_track_total = 0
+            out_f = res.frame
             if collected > WARMUP:
                 t0 = time.perf_counter()
-                if enhancer_mod is not None and face is not None:
-                    out_f = enhancer_mod.process_frame(None, out_f, detected_faces=[face])
-                p_bboxes = [bbox] if bbox is not None else []
+                if not res.passthrough and res.pred_img is not None:
+                    out_f = fs.finalize_swap(
+                        res.swapper, res.target_face, out_f,
+                        res.pred_img, res.pred_mask, res.aimg, res.M)
+                stages["final"] += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                if enhancer_mod is not None and res.target_face is not None:
+                    out_f = enhancer_mod.process_frame(
+                        None, out_f, detected_faces=[res.target_face])
+                stages["enh"] += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                p_bboxes = [res.bbox] if res.bbox is not None else []
                 out_f = fs.apply_post_processing(out_f, p_bboxes)
                 stages["post"] += time.perf_counter() - t0
-            if args.save_frame and collected == WARMUP + 30 and not saved:
+                now = time.perf_counter()
+                if last_emit is not None:
+                    intervals.append((now - last_emit) * 1000.0)
+                last_emit = now
+            # Save keyed on the SUBMIT index (res.idx), not the collected
+            # counter, so it matches the serial path's frames[WARMUP+30] exactly
+            # (serial saves at loop index i == WARMUP+30). Same source frame ->
+            # a meaningful PSNR comparison.
+            if args.save_frame and res.idx == WARMUP + 30 and not saved:
                 cv2.imwrite(os.path.expanduser(args.save_frame), out_f)
                 saved = True
 
-        # Submit (ALL frames, including warmup — warmup triggers ANE compilation)
+    while submitted < total_f:
+        # detect/track + prepare exactly ONCE per frame (ALL frames, including
+        # warmup — warmup triggers ANE compilation). Retrying the *submit* only,
+        # never the detection, mirrors the live thread's per-frame work.
         frame = frames[submitted % len(frames)]
-
         temp_frame = frame.copy()
         run_det = (submitted % args.detect_every == 0) or cached_target_face is None
         if run_det:
@@ -222,38 +279,32 @@ def _run_pool(args, frames, source_face, enhancer_mod):
                 track_timer += t1 - t0
                 n_track_total += 1
 
-        ok = True
         if cached_target_face is not None:
-            ok = pool.try_submit(temp_frame, cached_target_face, source_face)
+            t0 = time.perf_counter()
+            blob, latent, aimg, M = ref.prepare(temp_frame, cached_target_face, source_face)
+            if submitted >= WARMUP:
+                stages["prep"] += time.perf_counter() - t0
+            # Retry submit (draining between) until the pool accepts it. Draining
+            # inside the retry releases the semaphore, so this cannot deadlock.
+            while pool.try_submit(temp_frame, cached_target_face, blob, latent, aimg, M) is None:
+                _drain()
+                time.sleep(0.002)
         else:
             pool.submit_passthrough(temp_frame, face=None)
-        if ok is None:
-            time.sleep(0.01)
-            continue  # retry submit on next iteration after drain
         submitted += 1
+        _drain()
 
     # Drain remaining
     while collected < total_f:
-        for _idx, out_f, bbox, face in pool.collect_ready():
-            collected += 1
-            if collected == WARMUP + 1 and total_t0 is None:
-                total_t0 = time.perf_counter()
-                for k in stages:
-                    stages[k] = 0.0
-            if collected > WARMUP:
-                t0 = time.perf_counter()
-                if enhancer_mod is not None and face is not None:
-                    out_f = enhancer_mod.process_frame(None, out_f, detected_faces=[face])
-                p_bboxes = [bbox] if bbox is not None else []
-                out_f = fs.apply_post_processing(out_f, p_bboxes)
-                stages["post"] += time.perf_counter() - t0
+        _drain()
         if collected < total_f:
-            time.sleep(0.01)
+            time.sleep(0.005)
 
     total = time.perf_counter() - total_t0
     pool.stop()
 
-    print(f"\n=== bench_live results (--pool, {n} frames, warmup {WARMUP}) ===")
+    tag = "ANE+GPU" if args.dual_session else "ANE-only"
+    print(f"\n=== bench_live results (--pool {tag}, {n} frames, warmup {WARMUP}) ===")
     print(f"FPS: {n / total:.2f}   total {total*1000:.0f} ms   "
           f"{total/n*1000:.2f} ms/frame")
     if n_detect_total:
@@ -262,9 +313,12 @@ def _run_pool(args, frames, source_face, enhancer_mod):
     if n_track_total:
         print(f"track  : {track_timer/max(n_track_total,1)*1000:7.2f}"
               f" ms/track   x{n_track_total}")
+    print(f"prep   : {stages['prep']/n*1000:7.2f} ms/frame")
+    print(f"final  : {stages['final']/n*1000:7.2f} ms/frame")
     if stages["enh"]:
         print(f"enh    : {stages['enh']/n*1000:7.2f} ms/frame")
     print(f"post   : {stages['post']/n*1000:7.2f} ms/frame")
+    _print_frame_times(intervals)
 
 
 def main():

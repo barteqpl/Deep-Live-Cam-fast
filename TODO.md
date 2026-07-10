@@ -1,5 +1,31 @@
 # TODO: Dual-session pipelined live swap (branch `feat/dual-session-pipeline`)
 
+> **STATUS 2026-07-10 (po Fazie 3.2 — GIL relief, DONE):** ANE-only pool teraz
+> BIJE serial i ma gładki pacing → **pool jest DEFAULT dla hyperswap single-face
+> live** (`--dual-session` dalej opcjonalny GPU worker). Refactor: worker robi
+> WYŁĄCZNIE `session.run` (GIL zwolniony); cała praca CPU (align/latent w
+> `prepare`, denorm/color/paste w `finalize`, mouth mask, opacity, post) przeszła
+> na wątek główny za `collect_ready`. Zmierzone (M4 Pro, 120 klatek, serial/pool
+> interleaved dla stałego stanu termicznego):
+>
+> | Config | FPS | p95/p50 |
+> |---|---|---|
+> | serial (baseline) | ~14.8 | 1.30x |
+> | **pool ANE-only** | **~16.4 (+10%)** | **1.08x** |
+> | pool + mouth-mask | 16.5 (koszt ~0%) | 1.06x |
+> | simswap serial (regresja) | 34.6 (bez zmian) | 1.29x |
+>
+> Pool wygrywa w KAŻDYM interleaved runie (16.2-16.6 vs 14.7-15.0), a pacing
+> 1.08x vs 1.30x = koniec szarpania u źródła (jednorodne ~60 ms klatki, brak
+> wariancji 3x jak w dualu). Target 16.5 trafiony w granicach wariancji; próg
+> abortu (15.5) z zapasem. PSNR pool-vs-serial = 53 dB (ta sama klatka).
+> Uwaga metodologiczna: pierwszy "zimny" run po załadowaniu modelu potrafi dać
+> serial 17.4 / pool 16.0 (outlier startowy) — mierz interleaved, ≥120 klatek.
+> poisson_blend jest wykluczony z gałęzi pool (brak pre-swap full frame) —
+> `_use_pool()` to bramkuje. Dual (GPU) dalej opt-in: wyższa śr. FPS, ale
+> bursty pacing (patrz 2.3). Następne kroki: 2.4 soak test, 3.1 E5RT.
+>
+> --- (poprzedni STATUS, Faza 1+2) ---
 > **STATUS 2026-07-10 (po implementacji Fazy 1+2):** Faza 1 zrobiona i zweryfikowana
 > (pool w ui.py + bench_live --pool). Zmierzone: serial 14.2 FPS, pool ANE-only
 > 14.75 (+4% — GIL ogranicza, patrz 3.2), **pool dual ANE+GPU 18.3-18.9 FPS (+29%)**.
@@ -162,9 +188,19 @@ Gate: Faza 1 stabilna (brak crashy CoreML przy dłuższym runie ≥5 min, FPS �
       `ORT_LOGGING_LEVEL=VERBOSE`, znajdź który subgraph spada z ANE; może
       wystarczy `onnxsim` albo wycięcie problematycznego node'a. Potencjał: ANE
       19.5 → 22+ swaps/s.
-- [ ] 3.2 GIL relief: `cv2.setNumThreads(1)` w workerach; przenieś `_color_match`
-      i `_paste_back_roi` za collect (kosztem API poola — wtedy pool zwraca
-      (bgr_fake, mask, IM) zamiast gotowej klatki).
+- [x] 3.2 GIL relief — DONE 2026-07-10. Zrobione inaczej/lepiej niż szkic:
+      `HyperSwapSwapper.get()` rozbite na `prepare`/`infer`/`finalize`; worker
+      poola woła TYLKO `infer` (czysty `session.run`, GIL zwolniony), a `prepare`
+      (align+latent) leci na wątku głównym PRZED `try_submit`, `finalize`
+      (denorm+color+paste) + mouth mask + opacity + post PO `collect_ready`
+      (helper `finalize_swap` w face_swapper.py, reużywany przez ui.py i bench).
+      Pool zwraca surowe `_Result` (frame, target_face, aimg, M, pred_img,
+      pred_mask, bbox, swapper, passthrough), nie gotową klatkę. Nie było
+      potrzeby `cv2.setNumThreads(1)` — infer sam zwalnia GIL, więc główny wątek
+      nakłada detekcję/finalizację N±1 na inference N. Wynik: **ANE-only pool
+      ~16.4 FPS (+10% vs serial 14.8), pacing p95/p50 1.08x**, pool DEFAULT.
+      `_use_pool()` wyklucza map_faces/many_faces/poisson_blend. Zmierzone
+      liczby i tabela — patrz STATUS na górze pliku i benchmarks/README.md.
 - [ ] 3.3 Trzecia sesja? NIE — GPU już ledwo dokłada; CPU-sesja to ~1 s/klatkę.
 - [ ] 3.4 Rozszerz pool na many_faces (dziś poza zakresem gałęzi pool).
 

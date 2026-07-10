@@ -88,20 +88,31 @@ Findings:
 
 ## Pipelined pool results (`--pool`, branch feat/dual-session-pipeline)
 
-Same clip and harness as the table above (`bench_live.py --frames 60-90`):
+Same clip and harness as the table above (`bench_live.py --frames 120`,
+interleaved serial/pool to hold thermal state constant). Faza 3.2 (GIL relief):
+pool workers now run ONLY `session.run` (GIL released); all per-frame CPU work
+(prepare + finalize + mouth mask + post) moved to the main thread, so ANE-only
+inference overlaps detection/finalization with **uniform** pacing.
 
-| Config | Pipeline FPS |
-|---|---|
-| hyperswap-1b serial (baseline) | 14.2 |
-| hyperswap-1b `--pool` (ANE only) | 14.75 (+4% — GIL-bound) |
-| hyperswap-1b `--pool --dual-session` | **18.3-18.9 (+29%)** |
-| + `--mouth-mask` | 17.4 |
-| simswap serial (regression check) | 32.1 (unchanged) |
+| Config | Pipeline FPS | frame-time p95/p50 |
+|---|---|---|
+| hyperswap-1b serial (baseline) | ~14.8 | 1.30x |
+| hyperswap-1b `--pool` (ANE only) | **~16.4 (+10%)** | **1.08x** |
+| + `--mouth-mask` | 16.5 (cost ~0%) | 1.06x |
+| simswap serial (regression check) | 34.6 (unchanged) | 1.29x |
 
-Raw swaps/s (bench_dual_session.py: +11-17%) UNDERSTATES the in-pipeline
-dual gain: the GPU session keeps swapping while the ANE worker's per-frame
-CPU work (align/color/paste) holds the GIL. `dual_session` defaults to True
-for hyperswap live; `--no-dual-session` disables.
+Pacing, not just throughput, is the acceptance criterion: the ANE-only pool
+emits uniform ~52-56 ms frames (p95/p50 1.08x) vs the serial path's 1.30x, and
+beats serial in every interleaved run. **`--pool` is ON by default** for the
+hyperswap single-face live fast path (excludes map_faces / many_faces /
+poisson_blend). Quality vs serial: PSNR 53 dB on the same frame index.
+
+`--dual-session` still adds a second ONNX session on the GPU (opt-in). It raises
+average FPS but has bursty frame pacing (a ~150 ms GPU frame stalls emission of
+2-3 ready ANE frames), so it stays opt-in — see TODO.md 2.3.
+
+Pre-3.2 numbers, for reference: pool-through-full-`swap_face()` ANE-only was
+14.75 (+4%, GIL-bound); dual 18.3-18.9 (+29% avg but jumpy).
 
 ## Historical results (inswapper_128 optimization arc)
 

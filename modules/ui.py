@@ -1115,16 +1115,18 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
     pool = None
 
     def _use_pool() -> bool:
-        """Pool only for hyperswap single-face fast path, and only when the
-        user explicitly opted into --dual-session. ANE-only pooling gains a
-        mere +4% (GIL-bound) while adding 2-3 frames of latency, and dual
-        mode has bursty frame pacing (TODO.md 2.3) — so the stable serial
-        path stays the default."""
+        """Pool for the hyperswap single-face fast path, ON BY DEFAULT (Faza 3.2).
+
+        After moving all per-frame CPU work off the worker (GIL relief), the
+        ANE-only pool overlaps inference with detection/finalization and beats
+        the serial path with smooth, uniform pacing. --dual-session still adds a
+        second GPU worker (opt-in; bursty pacing, TODO.md 2.3). poisson_blend is
+        excluded because the pool path carries no pre-swap full frame for it."""
         m = modules.globals.swapper_model
-        return (modules.globals.dual_session
-                and m.startswith("hyperswap")
+        return (m.startswith("hyperswap")
                 and not modules.globals.map_faces
-                and not modules.globals.many_faces)
+                and not modules.globals.many_faces
+                and not modules.globals.poisson_blend)
 
     def _ensure_pool():
         nonlocal pool
@@ -1174,17 +1176,24 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                 pass
 
     while not stop_event.is_set():
-        # --- 1. DRAIN — collect finished pool jobs ---
+        # --- 1. DRAIN — collect finished pool jobs (MAIN-thread finalization) ---
         if pool is not None:
-            for _idx, out_frame, bbox, face in pool.collect_ready():
+            for res in pool.collect_ready():
+                out_frame = res.frame
+                # Finalize: denorm + paste-back + mouth mask + opacity (the CPU
+                # work the worker no longer does — Faza 3.2 GIL relief).
+                if not res.passthrough and res.pred_img is not None and fs_mod is not None:
+                    out_frame = fs_mod.finalize_swap(
+                        res.swapper, res.target_face, out_frame,
+                        res.pred_img, res.pred_mask, res.aimg, res.M)
                 # Run enhancer after swap, on the collected frame
-                detected = [face] if (face is not None and enh_mod is not None
-                                      and modules.globals.fp_ui.get("face_enhancer", False)) else []
-                if detected and enh_mod is not None:
-                    out_frame = enh_mod.process_frame(None, out_frame, detected_faces=detected)
+                face = res.target_face
+                if (face is not None and enh_mod is not None
+                        and modules.globals.fp_ui.get("face_enhancer", False)):
+                    out_frame = enh_mod.process_frame(None, out_frame, detected_faces=[face])
                 # Post-processing (sharpening, interpolation)
                 if fs_mod is not None:
-                    bboxes = [bbox] if bbox is not None else []
+                    bboxes = [res.bbox] if res.bbox is not None else []
                     out_frame = fs_mod.apply_post_processing(out_frame, bboxes)
                 _push_processed(out_frame)
 
@@ -1237,10 +1246,14 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
         use_pool = _use_pool()
         if use_pool:
             _ensure_pool()
-            if have_targets and not modules.globals.many_faces and cached_target_face is not None:
-                # Submit swap job; if pool full, frame is silently dropped
-                # (the caller will drain on the next loop iteration)
-                pool.try_submit(temp_frame, cached_target_face, source_image)
+            if (have_targets and not modules.globals.many_faces
+                    and cached_target_face is not None and source_image is not None):
+                # prepare (align + latent) runs on THIS thread; the worker runs
+                # infer() only. If the pool is full the frame is silently dropped
+                # (the caller drains on the next loop iteration).
+                ref = pool.reference_swapper
+                blob, latent, aimg, M = ref.prepare(temp_frame, cached_target_face, source_image)
+                pool.try_submit(temp_frame, cached_target_face, blob, latent, aimg, M)
             else:
                 # No face or many_faces — passthrough to maintain ordering
                 pool.submit_passthrough(temp_frame, bbox=None, face=cached_target_face)
