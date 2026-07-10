@@ -1,4 +1,4 @@
-<h1 align="center">Deep-Live-Cam-fast-1.0</h1>
+<h1 align="center">Deep-Live-Cam-fast 1.0.2</h1>
 
 <p align="center">
   Real-time face swap and video deepfake with a single click and only a single image.
@@ -11,6 +11,35 @@
 <p align="center">
   <img src="media/demo.gif" alt="Demo GIF" width="800">
 </p>
+
+## Fast edition — what's different in this fork
+
+This fork optimizes the **live webcam pipeline for Apple Silicon** (developed
+and measured on an M4 Pro). Version 1.0.2 highlights:
+
+- **onnxruntime 1.27** on macOS: the CoreML EP runs the whole inswapper graph
+  as a single partition (1.19 shattered it into 16 partitions with CPU
+  fallbacks) — raw inference dropped from 68 ms to 46 ms per frame.
+- **fp16 inswapper by default on Apple Silicon**: halves per-inference weight
+  traffic (264 MB vs 528 MB) on unified memory — 37.5 ms inference. Output is
+  visually identical to fp32 (PSNR 60 dB, max pixel diff 1/255).
+- **ROI paste-back**: warp + mask + blend run only in the face bounding box
+  instead of the full frame, plus removal of several full-frame copies per
+  frame in the hot path.
+- **Detection-only fast path in live mode**: the target face needs bbox+kps
+  only; the unused ArcFace embedding is skipped (13.8 -> 9 ms per detection
+  frame, full detection every 3rd frame with LK optical-flow tracking between).
+- **Face tracker + detection interval, face enhancer routing, soft ellipse
+  masks** and other live-path optimizations from earlier 1.0.x releases.
+
+Net effect on the reference clip (960x540): **12.9 -> 22.7 FPS** in the
+headless pipeline benchmark, with no quality regression. See
+[`benchmarks/`](benchmarks/README.md) for the harness, methodology, and how to
+re-tune CoreML provider settings after future onnxruntime upgrades.
+
+The default model is **inswapper_128** (fp16 variant on Apple Silicon); the
+app always starts with it unless `--swapper-model` is passed. The model
+dropdown in the UI applies to the current session only.
 
 ##  Disclaimer
 

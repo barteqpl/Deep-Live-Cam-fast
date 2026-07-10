@@ -116,7 +116,6 @@ def save_switch_states():
         "show_fps": modules.globals.show_fps,
         "mouth_mask": modules.globals.mouth_mask,
         "show_mouth_mask_box": False,
-        "swapper_model": modules.globals.swapper_model,
     }
     with open("switch_states.json", "w") as f:
         json.dump(switch_states, f)
@@ -153,8 +152,9 @@ def load_switch_states():
         if not any(arg in cli_args for arg in ["--mouth-mask"]):
             modules.globals.mouth_mask = switch_states.get("mouth_mask", False)
         modules.globals.show_mouth_mask_box = False
-        if not any(arg in cli_args for arg in ["--swapper-model"]):
-            modules.globals.swapper_model = switch_states.get("swapper_model", "inswapper")
+        # swapper_model is intentionally NOT restored from switch_states: the
+        # app always starts with the default (inswapper) unless --swapper-model
+        # is passed; the dropdown choice applies to the current session only.
     except FileNotFoundError:
         # If the file doesn't exist, use default values
         pass

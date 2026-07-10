@@ -33,3 +33,6 @@ install.bat
 .insightface/
 *.pth
 HANDOFF.md
+BasicSR/
+benchmarks/*.png
+benchmarks/*.json
