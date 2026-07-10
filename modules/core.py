@@ -64,12 +64,14 @@ def parse_args() -> None:
     program.add_argument('--sharpness', help='sharpness enhancement factor for swapped face (0.0-1.0+)', dest='sharpness', type=float, default=0.15)
     program.add_argument('--chin-blend-weight', help='blend weight for custom chin/jawline mask enhancement (0.0-1.0)', dest='chin_blend_weight', type=float, default=0.5)
     program.add_argument('--max-memory', help='maximum amount of RAM in GB', dest='max_memory', type=int, default=suggest_max_memory())
-    # Dual session measured in-pipeline: 14.2 -> 18.3-18.9 FPS (+29%) on M4 Pro
-    # (raw swaps/s underestimates it: the GPU session absorbs frames while the
-    # ANE worker's CPU post-work holds the GIL). Default ON; disable with
-    # --no-dual-session if VRAM/visual issues appear.
-    program.add_argument('--dual-session', help='second ONNX session on GPU alongside ANE for hyperswap live (default on)', dest='dual_session', action='store_true', default=True)
-    program.add_argument('--no-dual-session', help='disable the second GPU session for hyperswap live', dest='dual_session', action='store_false')
+    # Dual session raises average FPS (14.2 -> 18.3-18.9 on M4 Pro) but mixing
+    # ~56 ms ANE frames with ~150 ms GPU frames makes frame pacing bursty:
+    # ANE results wait in the reorder buffer behind each GPU frame, then flush
+    # at once into the 2-slot display queue (drop-oldest) — visible stutter.
+    # Confirmed on a real camera, so it stays OPT-IN until pacing is fixed
+    # (TODO.md Faza 2.3/3.2).
+    program.add_argument('--dual-session', help='EXPERIMENTAL: second ONNX session on GPU for hyperswap live; higher avg FPS but bursty frame pacing', dest='dual_session', action='store_true', default=False)
+    program.add_argument('--no-dual-session', help=argparse.SUPPRESS, dest='dual_session', action='store_false')
     program.add_argument('--execution-provider', help='execution provider', dest='execution_provider', default=[suggest_default_execution_provider()], choices=suggest_execution_providers(), nargs='+')
     program.add_argument('--execution-threads', help='number of execution threads', dest='execution_threads', type=int, default=suggest_execution_threads())
     program.add_argument('-v', '--version', action='version', version=f'{modules.metadata.name} {modules.metadata.version}')

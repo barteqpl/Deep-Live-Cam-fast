@@ -75,7 +75,7 @@ mouth_mask_size: float = 0.0       # Mouth mask size (0-100; 0=off, 100=mouth to
 enable_interpolation: bool = True # Toggle temporal smoothing
 interpolation_weight: float = 0  # Blend weight for current frame (0.0-1.0). Lower=smoother.
 chin_blend_weight: float = 0.5   # Strength of custom chin mask blending (0.0-1.0)
-dual_session: bool = True        # Druga sesja ONNX na GPU obok ANE (hyperswap live): +29% FPS zmierzone
+dual_session: bool = False       # EKSPERYMENTALNE: +29% śr. FPS, ale skaczący frame pacing (patrz TODO.md 2.3)
 swapper_pool: "Any | None" = None  # Referencja do SwapperPool (dla stop z UI, unika circular import)
 
 # --- END OF FILE globals.py ---

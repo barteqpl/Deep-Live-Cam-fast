@@ -1115,9 +1115,14 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
     pool = None
 
     def _use_pool() -> bool:
-        """Pool can be used only for hyperswap single-face fast path."""
+        """Pool only for hyperswap single-face fast path, and only when the
+        user explicitly opted into --dual-session. ANE-only pooling gains a
+        mere +4% (GIL-bound) while adding 2-3 frames of latency, and dual
+        mode has bursty frame pacing (TODO.md 2.3) — so the stable serial
+        path stays the default."""
         m = modules.globals.swapper_model
-        return (m.startswith("hyperswap")
+        return (modules.globals.dual_session
+                and m.startswith("hyperswap")
                 and not modules.globals.map_faces
                 and not modules.globals.many_faces)
 

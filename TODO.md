@@ -6,9 +6,25 @@
 > WAŻNA KOREKTA: raw bench (bench_dual_session, +11-17%) ZANIŻA zysk dualu w
 > pipeline — druga sesja GPU absorbuje klatki, gdy CPU-work workera ANE trzyma GIL.
 > Dlatego `dual_session` jest default **True** (bramka 2.2 spełniona: 18.3 ≥ 16).
-> Zostało: 2.3 (wizualna kontrola migotania ANE/GPU — wymaga kamery, PSNR 57 dB
-> sugeruje OK), 2.4 (15-min soak: RSS + thermal), Faza 3 opcjonalna (3.2 GIL
-> relief może podnieść ANE-only pool i dual jeszcze wyżej).
+> **2.3 WYKONANE NA KAMERZE — FAIL (2026-07-10):** dual daje wyższe średnie FPS,
+> ale subiektywnie obraz "skacze" i aplikacja wydaje się wolna. Root cause:
+> WARIANCJA FRAME-TIME, nie throughput — klatka GPU (~150 ms) blokuje emisję
+> 2-3 gotowych klatek ANE (~56 ms) w buforze kolejności; potem burst wpada do
+> processed_queue (maxsize=2, drop-oldest) i klatki lecą na podłogę → szarpany
+> ruch + 200-400 ms latencji. Dlatego dual i pool są z powrotem OPT-IN
+> (`--dual-session`); domyślna ścieżka = stabilny serial.
+>
+> Jak to naprawić (dla przejmującego, w kolejności opłacalności):
+> 1. **Paced emission**: emituj z bufora kolejności w stałym takcie
+>    (np. EMA frame-time), nie natychmiast po skompletowaniu — kosztem
+>    +1 klatki latencji wygładza burst. Wymaga też processed_queue maxsize
+>    ~4 dla trybu pool.
+> 2. **Fixed-phase GPU**: przydzielaj GPU co K-tą klatkę (K=3, stała faza)
+>    zamiast greedy — przewidywalny wzorzec zamiast losowych bąbli.
+> 3. **Faza 3.2 (GIL relief)**: przenieś align/color/paste za collect —
+>    wtedy ANE-only pool (bez GPU, bez wariancji 3x) może dać realny zysk
+>    i problem pacingu znika u źródła. NAJLEPSZA ścieżka długoterminowo.
+> Faza 2.4 (soak) dopiero po naprawieniu pacingu.
 
 > Handoff-ready plan. Wszystkie liczby zmierzone na M4 Pro, macOS 26.x, ORT 1.27,
 > model `hyperswap_1b_256.onnx`, klip testowy 960x540. Assety testowe robisz tak:
