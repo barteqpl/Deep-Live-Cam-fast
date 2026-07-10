@@ -169,6 +169,13 @@ git clone https://github.com/barteqpl/Deep-Live-Cam-fast.git
 cd Deep-Live-Cam-fast
 ```
 
+For a faster download without full git history (recommended if you just want
+to run the app), use a shallow clone:
+
+```bash
+git clone --depth 1 https://github.com/barteqpl/Deep-Live-Cam-fast.git
+```
+
 ---
 
 ### 2. Set Up Virtual Environment
