@@ -69,6 +69,11 @@ if sys.platform.startswith("linux"):
 from modules import platform_info
 platform_info.print_banner()
 
+# Filter benign CoreML/ANE fallback diagnostics out of stderr before any
+# onnxruntime session is created (must run before the first CoreML import).
+from modules import coreml_log_filter
+coreml_log_filter.install()
+
 from modules import core
 
 if __name__ == '__main__':

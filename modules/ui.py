@@ -139,7 +139,7 @@ def load_switch_states():
         if not any(arg in cli_args for arg in ["--map-faces"]):
             modules.globals.map_faces = switch_states.get("map_faces", False)
         modules.globals.poisson_blend = switch_states.get("poisson_blend", False)
-        modules.globals.color_correction = switch_states.get("color_correction", False)
+        modules.globals.color_correction = switch_states.get("color_correction", True)
         if not any(arg in cli_args for arg in ["--nsfw-filter"]):
             modules.globals.nsfw_filter = switch_states.get("nsfw_filter", False)
         if not any(arg in cli_args for arg in ["--live-mirror"]):

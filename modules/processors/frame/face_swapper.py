@@ -87,12 +87,17 @@ def get_crop_mask(size: int) -> np.ndarray:
     erode/blur operations on full frame sizes, while preventing box artifacts."""
     if size not in _CROP_MASK_CACHE:
         mask = np.zeros((size, size), dtype=np.float32)
-        center = (size // 2, int(size * 0.52)) # Center of face shifted down to cover chin
-        axes = (int(size * 0.38), int(size * 0.47)) # Vertically longer to cover chin/jawline
+        # Narrow core-face ellipse: 0.30 half-width keeps the mask inside the
+        # cheeks so ears are never covered (a wider mask paste-back produced a
+        # ghost "ear on ear" when source/target face widths differ), and the
+        # bottom stays above the neck to avoid jawline seams.
+        center = (size // 2, int(size * 0.50))
+        axes = (int(size * 0.30), int(size * 0.42))
         cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
-        
-        # Apply Gaussian blur to feather the boundary smoothly
-        k_blur = max(size // 8, 5)
+
+        # Strong feather so the boundary dissolves into the target skin instead
+        # of leaving a visible oval edge on large frontal faces.
+        k_blur = max(int(size * 0.13), 5)
         if k_blur % 2 == 0:
             k_blur += 1
         mask = cv2.GaussianBlur(mask, (k_blur, k_blur), 0)
@@ -170,6 +175,33 @@ class CrossfaceConverter:
         out = out.ravel()
         out_norm = out / np.linalg.norm(out)
         return out_norm.reshape(1, -1).astype(np.float32)
+
+
+def _color_match(bgr_fake, aimg, crop_mask):
+    """Reinhard mean/std color transfer (LAB) pulling the swapped crop toward the
+    target crop's skin tone, weighted to the masked face region. Removes the
+    discolored-patch look where swapped skin doesn't match the target's.
+
+    Gated by modules.globals.color_correction (default on). Operates on the
+    256/128 crop so the cost is negligible.
+    """
+    if not getattr(modules.globals, "color_correction", True):
+        return bgr_fake
+    # Mask-weighted moments (vectorized, no boolean gather) — the soft mask is
+    # the weight so the transfer is driven by the visible face region.
+    w = crop_mask.astype(np.float32)
+    wsum = float(w.sum())
+    if wsum < 50.0:
+        return bgr_fake
+    f = cv2.cvtColor(bgr_fake, cv2.COLOR_BGR2LAB).astype(np.float32)
+    t = cv2.cvtColor(aimg, cv2.COLOR_BGR2LAB).astype(np.float32)
+    w3 = w[..., None]
+    fm = (f * w3).reshape(-1, 3).sum(0) / wsum
+    tm = (t * w3).reshape(-1, 3).sum(0) / wsum
+    fsd = np.sqrt((((f - fm) ** 2) * w3).reshape(-1, 3).sum(0) / wsum) + 1e-5
+    tsd = np.sqrt((((t - tm) ** 2) * w3).reshape(-1, 3).sum(0) / wsum) + 1e-5
+    f = (f - fm) * (tsd / fsd) + tm
+    return cv2.cvtColor(np.clip(f, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
 def _paste_back_roi(img, bgr_fake, crop_mask, IM, blur_mask=False):
@@ -271,8 +303,11 @@ class HiFiFaceSwapper:
         IM = cv2.invertAffineTransform(M)
         mask_fake = pred_mask[0, 0]  # [256, 256]
         mask_fake = apply_chin_blend_to_mask(mask_fake, 256)
-        # Apply margin mask to prevent rectangular border bleeding
+        # Intersect the model mask with the narrow core-face ellipse so ears are
+        # never pasted (prevents the ghost "ear on ear"), then fade the border.
+        mask_fake = mask_fake * (get_crop_mask(256) / 255.0)
         mask_fake = mask_fake * get_margin_mask(256)
+        bgr_fake = _color_match(bgr_fake, aimg, mask_fake)
         return _paste_back_roi(img, bgr_fake, mask_fake, IM)
 
 class SimSwapSwapper:
@@ -338,6 +373,7 @@ class SimSwapSwapper:
         crop_mask = get_crop_mask(self.input_size[0]) / 255.0
         crop_mask = apply_chin_blend_to_mask(crop_mask, self.input_size[0])
         crop_mask = crop_mask * get_margin_mask(self.input_size[0])
+        bgr_fake = _color_match(bgr_fake, aimg, crop_mask)
         return _paste_back_roi(img, bgr_fake, crop_mask, IM)
 
 
@@ -386,8 +422,11 @@ class HyperSwapSwapper:
         IM = cv2.invertAffineTransform(M)
         crop_mask = pred_mask[0, 0]  # [256, 256] float
         crop_mask = apply_chin_blend_to_mask(crop_mask, 256)
-        # Apply margin mask to prevent rectangular border bleeding
+        # Intersect the model mask with the narrow core-face ellipse so ears are
+        # never pasted (prevents the ghost "ear on ear"), then fade the border.
+        crop_mask = crop_mask * (get_crop_mask(256) / 255.0)
         crop_mask = crop_mask * get_margin_mask(256)
+        bgr_fake = _color_match(bgr_fake, aimg, crop_mask)
         return _paste_back_roi(img, bgr_fake, crop_mask, IM, blur_mask=True)
 
 
@@ -507,38 +546,12 @@ def optimized_swapper_get(self, img, target_face, source_face, paste_back=True):
         return bgr_fake, M
         
     IM = cv2.invertAffineTransform(M)
-
-    # The mask is zero outside the warped 128x128 crop, so warping and blending
-    # only need to touch the ROI that crop maps to — not the whole frame.
-    # Full-frame float32 blend costs ~5-6 memory passes over the frame; the ROI
-    # is typically ~5% of it (memory-bandwidth win on unified-memory Macs).
     size = aimg.shape[0]
-    corners = np.array([[0, 0], [size, 0], [size, size], [0, size]], dtype=np.float32)
-    warped_corners = corners @ IM[:, :2].T + IM[:, 2]
-    x0 = max(int(np.floor(warped_corners[:, 0].min())) - 1, 0)
-    y0 = max(int(np.floor(warped_corners[:, 1].min())) - 1, 0)
-    x1 = min(int(np.ceil(warped_corners[:, 0].max())) + 1, img.shape[1])
-    y1 = min(int(np.ceil(warped_corners[:, 1].max())) + 1, img.shape[0])
-    if x1 <= x0 or y1 <= y0:
-        return img.copy()
-
-    IM_roi = IM.copy()
-    IM_roi[0, 2] -= x0
-    IM_roi[1, 2] -= y0
-    roi_size = (x1 - x0, y1 - y0)
-    bgr_fake_warped = cv2.warpAffine(bgr_fake, IM_roi, roi_size, flags=cv2.INTER_CUBIC, borderValue=0.0)
-
     crop_mask = get_crop_mask(size) / 255.0
     crop_mask = apply_chin_blend_to_mask(crop_mask, size)
     crop_mask = crop_mask * get_margin_mask(size)
-    img_mask = cv2.warpAffine(crop_mask, IM_roi, roi_size, borderValue=0.0)
-    img_mask = img_mask[:, :, None]
-
-    out = img.copy()
-    roi = out[y0:y1, x0:x1]
-    merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * roi.astype(np.float32)
-    roi[:] = merged.astype(np.uint8)
-    return out
+    bgr_fake = _color_match(bgr_fake, aimg, crop_mask)
+    return _paste_back_roi(img, bgr_fake, crop_mask, IM)
 
 
 def clear_face_swapper() -> None:

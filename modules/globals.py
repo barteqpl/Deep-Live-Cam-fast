@@ -28,7 +28,7 @@ keep_frames: bool = False
 many_faces: bool = False         # Process all detected faces with default source
 map_faces: bool = False          # Use source_target_map or simple_map for specific swaps
 poisson_blend: bool = False      # Enable Poisson Blending for smoother face swaps
-color_correction: bool = False   # Enable color correction (implementation specific)
+color_correction: bool = True    # LAB color transfer of swapped face to target skin tone
 nsfw_filter: bool = False
 
 # Video Output Options

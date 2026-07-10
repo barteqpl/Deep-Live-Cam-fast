@@ -1,4 +1,4 @@
-<h1 align="center">Deep-Live-Cam-fast 1.0.3</h1>
+<h1 align="center">Deep-Live-Cam-fast 1.0.4</h1>
 
 <p align="center">
   Real-time face swap and video deepfake with a single click and only a single image.
@@ -15,7 +15,20 @@
 ## Fast edition — what's different in this fork
 
 This fork optimizes the **live webcam pipeline for Apple Silicon** (developed
-and measured on an M4 Pro). Version 1.0.3 highlights:
+and measured on an M4 Pro). Version 1.0.4 highlights:
+
+- **Cleaner blending** — the paste-back mask is a narrow, strongly-feathered
+  core-face ellipse that excludes the ears (no more ghost "ear on ear" when
+  source/target face widths differ) and stays above the neck to avoid jawline
+  seams. Model-generated masks (HyperSwap/HiFiFace) are intersected with it.
+- **LAB color transfer** (`color_correction`, on by default) matches the
+  swapped face's skin tone to the target region, removing the discolored-patch
+  look on large frontal faces. ~3 ms/frame; toggle off if unwanted.
+- **Quiet console** — benign CoreML/ANE fallback diagnostics (the
+  `E5RT ... unbounded dimension` / `ANECCompile FAILED` spam that appeared on
+  model switch and at exit) are filtered from stderr; real errors still show.
+
+Version 1.0.3:
 
 - **SimSwap 256 as the default model** — fastest and visually strongest in our
   live tests: **35 FPS** in the headless pipeline benchmark (960x540).
