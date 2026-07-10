@@ -53,10 +53,13 @@ def main():
     ap.add_argument("--detect-every", type=int, default=DETECT_EVERY_N)
     ap.add_argument("--save-frame", default=None, help="save processed frame #30 as PNG")
     ap.add_argument("--sharpness", type=float, default=None)
+    ap.add_argument("--model", default=None, help="swapper model: inswapper|simswap|hififace|hyperswap")
     args = ap.parse_args()
 
     if args.sharpness is not None:
         modules.globals.sharpness = args.sharpness
+    if args.model:
+        modules.globals.swapper_model = args.model
 
     src_img = cv2.imread(os.path.expanduser(args.source))
     assert src_img is not None, f"cannot read source {args.source}"

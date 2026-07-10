@@ -37,7 +37,28 @@ Watch the `GetCapability ... number of partitions` warning in the output:
 more than 1 partition means CPU fallbacks inside the graph — usually the
 dominant cost on Apple Silicon.
 
-## Reference results (Apple M4 Pro, 960x540, inswapper_128)
+## bench_256_models.py — 256px swapper inference matrix
+
+Times `session.run` of simswap / hififace / hyperswap across CoreML configs
+(GPU vs Neural Engine). Add `--optimized` to route through
+`optimize_for_coreml` first, or a model name to test one variant.
+
+## Reference results (Apple M4 Pro, 960x540)
+
+Per-model raw inference and full-pipeline FPS (`bench_live.py --model ...`):
+
+| Model | Best compute units | Inference | Pipeline FPS |
+|---|---|---|---|
+| simswap_256 (default) | GPU (`CPUAndGPU`) | 21.5 ms | 35.2 |
+| inswapper_128 fp16 | GPU (`CPUAndGPU`) | 37.5 ms | 22.7 |
+| hififace_256 | GPU (`CPUAndGPU`) | 46.5 ms | — |
+| hyperswap_256 | **ANE (`CPUAndNeuralEngine`)** | 46.6 ms (was 137.5 on GPU) | 17.2 |
+
+HyperSwap is the notable case: it is ~3x faster on the Neural Engine, while
+simswap (81 ms) and hififace (116 ms) get *slower* on ANE — compute-unit
+routing is per-model, not global (see `get_face_swapper`).
+
+## Historical results (inswapper_128 optimization arc)
 
 | Configuration | Inference | Pipeline FPS |
 |---|---|---|

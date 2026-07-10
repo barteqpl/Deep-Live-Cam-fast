@@ -10,10 +10,10 @@ Four main face swap models are supported in the project. Model selection is done
 
 | Model | Resolution | Performance Overhead | Requires Converter | Recommended Use Case |
 | :--- | :---: | :---: | :---: | :--- |
-| **SimSwap 256** | 256x256 | Low | Yes | **Best for live webcam use**. Fastest inference time, preserves expression and head orientation very well. |
+| **SimSwap 256** | 256x256 | Low | Yes | **Default model. Best for live webcam use**. Fastest inference time, preserves expression and head orientation very well. |
 | **HyperSwap 256** | 256x256 | Medium | No | **Recommended as the default high-quality option**. Very strong transfer of source identity, does not require an additional converter, and produces very natural boundaries. |
 | **HiFiFace 256** | 256x256 | Medium | Yes | **Best for static image/video rendering**. Generates a very soft, built-in blending mask, but strongly adheres to the target face geometry (so you might "still look like yourself"). |
-| **Inswapper 128** | 128x128 | Medium | No | Default model. Low resolution results in visible blurring on modern HD cameras/videos. |
+| **Inswapper 128** | 128x128 | Medium | No | Low resolution results in visible blurring on modern HD cameras/videos. |
 
 ---
 

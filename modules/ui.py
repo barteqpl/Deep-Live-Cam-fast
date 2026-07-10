@@ -153,7 +153,7 @@ def load_switch_states():
             modules.globals.mouth_mask = switch_states.get("mouth_mask", False)
         modules.globals.show_mouth_mask_box = False
         # swapper_model is intentionally NOT restored from switch_states: the
-        # app always starts with the default (inswapper) unless --swapper-model
+        # app always starts with the default (simswap) unless --swapper-model
         # is passed; the dropdown choice applies to the current session only.
     except FileNotFoundError:
         # If the file doesn't exist, use default values

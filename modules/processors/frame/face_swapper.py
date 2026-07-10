@@ -172,6 +172,41 @@ class CrossfaceConverter:
         return out_norm.reshape(1, -1).astype(np.float32)
 
 
+def _paste_back_roi(img, bgr_fake, crop_mask, IM, blur_mask=False):
+    """Warp the swapped crop + its mask into the face ROI only and blend there.
+
+    The mask is zero outside the warped crop, so restricting warp+blend to the
+    crop's bounding box in frame space is mathematically identical to the
+    full-frame version while touching ~5% of the pixels (memory-bandwidth win
+    on unified-memory Apple Silicon). Returns a new frame; input not mutated.
+    """
+    size = bgr_fake.shape[0]
+    corners = np.array([[0, 0], [size, 0], [size, size], [0, size]], dtype=np.float32)
+    warped_corners = corners @ IM[:, :2].T + IM[:, 2]
+    x0 = max(int(np.floor(warped_corners[:, 0].min())) - 2, 0)
+    y0 = max(int(np.floor(warped_corners[:, 1].min())) - 2, 0)
+    x1 = min(int(np.ceil(warped_corners[:, 0].max())) + 2, img.shape[1])
+    y1 = min(int(np.ceil(warped_corners[:, 1].max())) + 2, img.shape[0])
+    if x1 <= x0 or y1 <= y0:
+        return img.copy()
+
+    IM_roi = IM.copy()
+    IM_roi[0, 2] -= x0
+    IM_roi[1, 2] -= y0
+    roi_size = (x1 - x0, y1 - y0)
+    bgr_fake_warped = cv2.warpAffine(bgr_fake, IM_roi, roi_size, flags=cv2.INTER_CUBIC, borderValue=0.0)
+    mask_roi = cv2.warpAffine(crop_mask, IM_roi, roi_size, borderValue=0.0)
+    if blur_mask:
+        mask_roi = cv2.GaussianBlur(mask_roi, (5, 5), 0)
+    mask_roi = mask_roi[:, :, None]
+
+    out = img.copy()
+    roi = out[y0:y1, x0:x1]
+    merged = mask_roi * bgr_fake_warped + (1.0 - mask_roi) * roi.astype(np.float32)
+    roi[:] = merged.astype(np.uint8)
+    return out
+
+
 class HiFiFaceSwapper:
     def __init__(self, model_path: str, providers: list, provider_options: list = None):
         import onnxruntime as ort
@@ -205,11 +240,17 @@ class HiFiFaceSwapper:
         blob = crop_rgb.transpose(2, 0, 1)
         blob = np.expand_dims(blob, axis=0).astype(np.float32)
 
-        # 3. Convert source embedding through crossface converter
-        if self.crossface is not None:
-            latent = self.crossface.convert(source_face.embedding).copy()
-        else:
-            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+        # 3. Convert source embedding through crossface converter (cached per
+        # source face — the converter output is constant for a given source)
+        latent = source_face.get("_crossface_latent_hififace", None)
+        if latent is None:
+            if self.crossface is not None:
+                latent = self.crossface.convert(source_face.embedding)
+            else:
+                latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32)
+            source_face._crossface_latent_hififace = latent
+        # Copy to avoid ONNX Runtime CoreML EP memory address caching crash
+        latent = latent.copy()
 
         # 4. Inference
         with THREAD_LOCK:
@@ -226,23 +267,13 @@ class HiFiFaceSwapper:
         if not paste_back:
             return bgr_fake, M
 
-        # 6. Paste back into original frame using model's output mask
+        # 6. Paste back into original frame using model's output mask (ROI only)
         IM = cv2.invertAffineTransform(M)
-        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
-
-        # Process and warp the mask
         mask_fake = pred_mask[0, 0]  # [256, 256]
         mask_fake = apply_chin_blend_to_mask(mask_fake, 256)
-        
         # Apply margin mask to prevent rectangular border bleeding
         mask_fake = mask_fake * get_margin_mask(256)
-
-        mask_warped = cv2.warpAffine(mask_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_LINEAR, borderValue=0.0)
-        mask_warped = np.reshape(mask_warped, [mask_warped.shape[0], mask_warped.shape[1], 1])
-
-        # Blend images: mask * swapped + (1 - mask) * original
-        fake_merged = mask_warped * bgr_fake_warped.astype(np.float32) + (1.0 - mask_warped) * img.astype(np.float32)
-        return fake_merged.astype(np.uint8)
+        return _paste_back_roi(img, bgr_fake, mask_fake, IM)
 
 class SimSwapSwapper:
     def __init__(self, model_path: str, providers: list, provider_options: list = None):
@@ -277,11 +308,17 @@ class SimSwapSwapper:
         blob = crop_rgb.transpose(2, 0, 1)
         blob = np.expand_dims(blob, axis=0).astype(np.float32)
 
-        # 3. Convert source embedding through crossface converter
-        if self.crossface is not None:
-            latent = self.crossface.convert(source_face.embedding).copy()
-        else:
-            latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32).copy()
+        # 3. Convert source embedding through crossface converter (cached per
+        # source face — the converter output is constant for a given source)
+        latent = source_face.get("_crossface_latent_simswap", None)
+        if latent is None:
+            if self.crossface is not None:
+                latent = self.crossface.convert(source_face.embedding)
+            else:
+                latent = source_face.normed_embedding.reshape((1, 512)).astype(np.float32)
+            source_face._crossface_latent_simswap = latent
+        # Copy to avoid ONNX Runtime CoreML EP memory address caching crash
+        latent = latent.copy()
 
         # 4. Inference
         with THREAD_LOCK:
@@ -296,19 +333,12 @@ class SimSwapSwapper:
         if not paste_back:
             return bgr_fake, M
 
-        # 6. Paste back using standard mask pipeline (scaled for 256x256)
+        # 6. Paste back using standard mask pipeline (ROI only, 256x256 crop)
         IM = cv2.invertAffineTransform(M)
-        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
-
-        # Paste back using pre-computed crop mask to avoid slow full-frame processing
         crop_mask = get_crop_mask(self.input_size[0]) / 255.0
         crop_mask = apply_chin_blend_to_mask(crop_mask, self.input_size[0])
         crop_mask = crop_mask * get_margin_mask(self.input_size[0])
-        img_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
-        img_mask = np.reshape(img_mask, [img_mask.shape[0], img_mask.shape[1], 1])
-
-        fake_merged = img_mask * bgr_fake_warped + (1.0 - img_mask) * img.astype(np.float32)
-        return fake_merged.astype(np.uint8)
+        return _paste_back_roi(img, bgr_fake, crop_mask, IM)
 
 
 class HyperSwapSwapper:
@@ -352,24 +382,13 @@ class HyperSwapSwapper:
         if not paste_back:
             return bgr_fake, M
 
-        # 6. Paste back using model's built-in mask (faster than manual erode/blur)
+        # 6. Paste back using model's built-in mask (ROI only)
         IM = cv2.invertAffineTransform(M)
-        bgr_fake_warped = cv2.warpAffine(bgr_fake, IM, (img.shape[1], img.shape[0]), flags=cv2.INTER_CUBIC, borderValue=0.0)
-
-        # Use model-generated mask (crop space) -> warp to full frame
         crop_mask = pred_mask[0, 0]  # [256, 256] float
         crop_mask = apply_chin_blend_to_mask(crop_mask, 256)
-        
         # Apply margin mask to prevent rectangular border bleeding
         crop_mask = crop_mask * get_margin_mask(256)
-
-        full_mask = cv2.warpAffine(crop_mask, IM, (img.shape[1], img.shape[0]), borderValue=0.0)
-        # Slight blur for smoother blending
-        full_mask = cv2.GaussianBlur(full_mask, (5, 5), 0)
-        full_mask = np.reshape(full_mask, [full_mask.shape[0], full_mask.shape[1], 1])
-
-        fake_merged = full_mask * bgr_fake_warped + (1.0 - full_mask) * img.astype(np.float32)
-        return fake_merged.astype(np.uint8)
+        return _paste_back_roi(img, bgr_fake, crop_mask, IM, blur_mask=True)
 
 
 FACE_SWAPPER = None
@@ -538,6 +557,15 @@ def get_face_swapper() -> Any:
             update_status(f"Loading face swapper model from: {model_path}", NAME)
             try:
                 # Optimized provider configuration for Apple Silicon
+                # Per-model compute-unit routing (measured on M4 Pro):
+                # hyperswap runs 3x faster on the Neural Engine (137.5 -> 46.6
+                # ms/inference, PSNR 58.5 dB vs GPU on the face region), while
+                # simswap (21 vs 81 ms) and hififace (46 vs 116 ms) are faster
+                # on GPU. ANE routing also frees the GPU for face detection.
+                compute_units = (
+                    "CPUAndNeuralEngine" if model_name == "hyperswap_1a_256.onnx"
+                    else "CPUAndGPU"
+                )
                 providers_config = []
                 for p in modules.globals.execution_providers:
                     if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
@@ -546,7 +574,7 @@ def get_face_swapper() -> Any:
                             "CoreMLExecutionProvider",
                             {
                                 "ModelFormat": "MLProgram",
-                                "MLComputeUnits": "CPUAndGPU",
+                                "MLComputeUnits": compute_units,
                                 "SpecializationStrategy": "FastPrediction",
                                 # fp16 accumulation on GPU: measured no quality
                                 # loss (PSNR 60 dB vs fp32) and lower latency

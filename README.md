@@ -1,4 +1,4 @@
-<h1 align="center">Deep-Live-Cam-fast 1.0.2</h1>
+<h1 align="center">Deep-Live-Cam-fast 1.0.3</h1>
 
 <p align="center">
   Real-time face swap and video deepfake with a single click and only a single image.
@@ -15,7 +15,20 @@
 ## Fast edition — what's different in this fork
 
 This fork optimizes the **live webcam pipeline for Apple Silicon** (developed
-and measured on an M4 Pro). Version 1.0.2 highlights:
+and measured on an M4 Pro). Version 1.0.3 highlights:
+
+- **SimSwap 256 as the default model** — fastest and visually strongest in our
+  live tests: **35 FPS** in the headless pipeline benchmark (960x540).
+- **HyperSwap routed to the Neural Engine**: the highest-quality model ran at
+  ~6 FPS on GPU; on the ANE its inference drops from 137.5 to 46.6 ms
+  (PSNR 58.5 dB vs GPU — indistinguishable), lifting the pipeline to
+  **17 FPS**. Detection stays on GPU, so the two no longer compete.
+- **Cached crossface identity latent** (SimSwap/HiFiFace) — the embedding
+  converter now runs once per source face instead of every frame.
+- **ROI paste-back for all 256px models** — warp + mask + blend touch only the
+  face bounding box instead of the full frame.
+
+Carried over from 1.0.2:
 
 - **onnxruntime 1.27** on macOS: the CoreML EP runs the whole inswapper graph
   as a single partition (1.19 shattered it into 16 partitions with CPU
@@ -37,9 +50,10 @@ headless pipeline benchmark, with no quality regression. See
 [`benchmarks/`](benchmarks/README.md) for the harness, methodology, and how to
 re-tune CoreML provider settings after future onnxruntime upgrades.
 
-The default model is **inswapper_128** (fp16 variant on Apple Silicon); the
-app always starts with it unless `--swapper-model` is passed. The model
-dropdown in the UI applies to the current session only.
+The default model is **SimSwap 256** (faster and visually better on Apple
+Silicon per our measurements); `inswapper_128` (fp16 on Apple Silicon) remains
+available via `--swapper-model inswapper`. The model dropdown in the UI applies
+to the current session only.
 
 ##  Disclaimer
 
@@ -308,7 +322,7 @@ options:
   --many-faces                                             process every face
   --map-faces                                              map source target faces
   --mouth-mask                                             mask the mouth region
-  --swapper-model {inswapper,hififace,simswap,hyperswap}   select face swapper model (default: inswapper)
+  --swapper-model {inswapper,hififace,simswap,hyperswap}   select face swapper model (default: simswap)
   --video-encoder {libx264,libx265,libvpx-vp9}             adjust output video encoder
   --video-quality [0-51]                                   adjust output video quality
   --live-mirror                                            the live camera display as you see it in the front-facing camera frame
