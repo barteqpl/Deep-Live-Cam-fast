@@ -225,11 +225,14 @@ Choose the acceleration provider matching your hardware:
     ```bash
     brew install python-tk@3.11
     ```
-2.  Install CoreML optimized packages:
-    ```bash
-    pip uninstall onnxruntime onnxruntime-silicon
-    pip install onnxruntime-silicon==1.16.3
-    ```
+2.  No extra packages needed: the official `onnxruntime` from
+    `requirements.txt` (1.27.0) ships the CoreML execution provider natively
+    on Apple Silicon.
+
+    > Do **not** install the legacy `onnxruntime-silicon` package — it was a
+    > third-party build for the pre-arm64 era, is stuck at 1.16, and would
+    > reintroduce the CoreML graph-partitioning slowdown this fork removed
+    > (see [`benchmarks/`](benchmarks/README.md)).
 3.  Run the application:
     ```bash
     python run.py --execution-provider coreml
