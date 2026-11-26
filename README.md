@@ -87,8 +87,10 @@ What changed:
   (recognizer ~200 ms, SimSwap ~610 ms per run). Each CUDA session now runs
   one test inference at load and, if needed, switches to another conv search
   and stays on the GPU (recognizer 17 ms, SimSwap 64 ms). Headless video swap
-  on a Kaggle T4 (84 frames, 960x540): 0.4-0.8 → 3.4-4.9 frames/s for
-  inswapper, SimSwap and HyperSwap, with onnxruntime-gpu 1.26 and 1.32 alike.
+  on a Kaggle T4 (84 frames, 960x540, inswapper/SimSwap/HyperSwap): 0.4-0.8
+  frames/s before, 3.4-4.9 with the fix in Kaggle's own environment, and
+  7.3-8.2 after a clean `pip install -r requirements.txt` or
+  `requirements-cuda12.txt` (torch and onnxruntime then share one cuDNN).
 - **CUDA: current onnxruntime, older GPUs still supported.**
   `requirements.txt` now installs `onnxruntime-gpu` 1.32 (CUDA 13, driver
   580+, RTX 20xx/T4 or newer) with CUDA and cuDNN from pip. Older GPUs and
