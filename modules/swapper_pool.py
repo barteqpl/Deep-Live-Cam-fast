@@ -107,10 +107,9 @@ class SwapperPool:
 
     def start(self) -> None:
         from modules.processors.frame.face_swapper import HyperSwapSwapper
-        # Primary session on GPU: with the CoreML-optimized hyperswap graph
-        # (2 partitions) GPU is ~1.8x faster than ANE (31 vs 58 ms raw, M4 Pro,
-        # macOS 26). use_gpu_session keeps its meaning of "add a second
-        # session", which now lands on the ANE.
+        # Primary session on GPU: fastest for hyperswap in the live pipeline
+        # (M4 Pro, macOS 26). use_gpu_session keeps its meaning of "add a
+        # second session", which now lands on the ANE.
         configs = [("GPU", dict(BASE_COREML_CFG, MLComputeUnits="CPUAndGPU"))]
         if self.use_gpu_session:
             configs.append(("ANE", dict(BASE_COREML_CFG, MLComputeUnits="CPUAndNeuralEngine")))

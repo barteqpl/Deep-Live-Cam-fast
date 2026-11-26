@@ -20,13 +20,10 @@ from typing import Any, Callable, Optional
 
 
 class PacedEmitter:
-    def __init__(self, sink: Callable[[Any], None], max_hold: int = 3,
-                 alpha: float = 0.1, beta: float = 0.05, delay_k: float = 2.0):
+    max_hold, alpha, beta, delay_k = 3, 0.1, 0.05, 2.0
+
+    def __init__(self, sink: Callable[[Any], None]):
         self._sink = sink
-        self.max_hold = max_hold
-        self.alpha = alpha
-        self.beta = beta
-        self.delay_k = delay_k
         self._q: deque = deque()          # (slot, item)
         self._cv = threading.Condition()
         self._ema: Optional[float] = None   # mean completion interval

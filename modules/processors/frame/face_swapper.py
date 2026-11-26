@@ -608,15 +608,6 @@ def get_face_swapper() -> Any:
             model_path = os.path.join(models_dir, model_name)
             update_status(f"Loading face swapper model from: {model_path}", NAME)
             try:
-                # Optimized provider configuration for Apple Silicon
-                # Per-model compute-unit routing (measured on M4 Pro):
-                # hyperswap runs 3x faster on the Neural Engine (137.5 -> 46.6
-                # ms/inference, PSNR 58.5 dB vs GPU on the face region), while
-                # simswap (21 vs 81 ms) and hififace (46 vs 116 ms) are faster
-                # on GPU. ANE routing also frees the GPU for face detection.
-                # Re-measured on macOS 26 with the CoreML-optimized hyperswap
-                # graph: GPU 31 ms vs ANE 58 ms raw, so every model runs on GPU.
-                compute_units = "CPUAndGPU"
                 providers_config = []
                 for p in modules.globals.execution_providers:
                     if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
@@ -625,7 +616,11 @@ def get_face_swapper() -> Any:
                             "CoreMLExecutionProvider",
                             {
                                 "ModelFormat": "MLProgram",
-                                "MLComputeUnits": compute_units,
+                                # GPU for every model (M4 Pro, macOS 26): the
+                                # hyperswap live pipeline measured fastest on GPU
+                                # (19 ms/inference); simswap 21 vs 81 ms and
+                                # hififace 46 vs 116 ms (GPU vs ANE).
+                                "MLComputeUnits": "CPUAndGPU",
                                 "SpecializationStrategy": "FastPrediction",
                                 # fp16 accumulation on GPU: measured no quality
                                 # loss (PSNR 60 dB vs fp32) and lower latency

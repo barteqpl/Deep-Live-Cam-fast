@@ -209,20 +209,20 @@ def _run_pool(args, frames, source_face, enhancer_mod):
     intervals = []          # per-emitted-frame wall interval (ms), post-warmup
     last_emit = None
     from modules.pacing import PacedEmitter
-    emit_state = {"last": None}
 
     def _emit(_item):
         # Runs on the emitter thread, like ui.py's paced _push_processed.
+        nonlocal last_emit
         now = time.perf_counter()
-        if emit_state["last"] is not None:
-            intervals.append((now - emit_state["last"]) * 1000.0)
-        emit_state["last"] = now
+        if last_emit is not None:
+            intervals.append((now - last_emit) * 1000.0)
+        last_emit = now
 
     pacer = PacedEmitter(_emit)   # mirrors ui.py paced emission
 
     def _drain():
         nonlocal collected, total_t0, detect_timer, track_timer
-        nonlocal n_detect_total, n_track_total, saved, last_emit
+        nonlocal n_detect_total, n_track_total, saved
         for res in pool.collect_ready():
             collected += 1
             if collected == WARMUP + 1 and total_t0 is None:

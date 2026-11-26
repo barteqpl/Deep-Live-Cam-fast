@@ -129,6 +129,7 @@ def _drop_broadcast_expand(model) -> bool:
         p = producer.get(t)
         return p is not None and p.op_type in _BROADCAST_OPS and y in p.input
 
+    outs = {o.name for o in g.output}
     drop = []
     for n in g.node:
         if n.op_type != "Expand" or len(n.input) != 2:
@@ -137,18 +138,14 @@ def _drop_broadcast_expand(model) -> bool:
         if shp is None or shp.op_type != "Shape" or len(shp.input) != 1:
             continue
         y = shp.input[0]
-        users = consumers.get(n.output[0], [])
-        if not users or any(u.op_type not in _BROADCAST_OPS for u in users):
+        e = n.output[0]
+        users = consumers.get(e, [])
+        if not users or e in outs:
             continue
-        ok = True
-        for u in users:
-            others = [i for i in u.input if i != n.output[0]]
-            if len(others) != 1 or not shaped_like(others[0], y):
-                ok = False
-                break
-        if not ok or any(o.name == n.output[0] for o in g.output):
-            continue
-        drop.append((n, shp, users))
+        others = [[i for i in u.input if i != e] for u in users]
+        if all(u.op_type in _BROADCAST_OPS and len(o) == 1 and shaped_like(o[0], y)
+               for u, o in zip(users, others)):
+            drop.append((n, shp, users))
 
     if not drop:
         return False

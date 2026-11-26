@@ -313,11 +313,9 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
     poisson_blend_switch.place(relx=0.1, rely=0.55)
 
     # --- Model Selection ---
-    def safe_update_status(text: str) -> None:
-        update_status(text)  # thread-safe: workers enqueue, see update_status
 
     def destroy_and_reload_model(new_model: str, restart_live: bool = False):
-        safe_update_status("Destroying model session...")
+        update_status("Destroying model session...")
         # Stop swapper pool if active
         pool_ref = modules.globals.swapper_pool
         if pool_ref is not None:
@@ -326,25 +324,26 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         import modules.processors.frame.face_swapper as face_swapper
         face_swapper.clear_face_swapper()
 
-        safe_update_status(f"Loading model {new_model}...")
+        update_status(f"Loading model {new_model}...")
+
+        # Resolve the camera here, on the main thread: StringVar.get() is a Tcl
+        # call and must not run in load_task.
+        cam_idx = None
+        if restart_live:
+            cam_name = CAMERA_VARIABLE.get() if CAMERA_VARIABLE else None
+            if CAMERA_NAMES and cam_name and cam_name in CAMERA_NAMES and cam_name != "No cameras found":
+                cam_idx = CAMERA_INDICES[CAMERA_NAMES.index(cam_name)]
 
         def load_task():
             try:
                 if face_swapper.pre_check() and face_swapper.pre_start():
-                    safe_update_status(f"Model {new_model} loaded successfully.")
-                    if restart_live:
-                        try:
-                            global CAMERA_VARIABLE, CAMERA_INDICES, CAMERA_NAMES
-                            cam_name = CAMERA_VARIABLE.get() if CAMERA_VARIABLE else None
-                            cam_idx = CAMERA_INDICES[CAMERA_NAMES.index(cam_name)] if CAMERA_NAMES and cam_name and cam_name != "No cameras found" else None
-                            if cam_idx is not None:
-                                call_on_main(lambda: webcam_preview(ROOT, cam_idx))
-                        except Exception as e:
-                            safe_update_status(f"Error restarting live preview: {e}")
+                    update_status(f"Model {new_model} loaded successfully.")
+                    if cam_idx is not None:
+                        call_on_main(lambda: webcam_preview(ROOT, cam_idx))
                 else:
-                    safe_update_status(f"Failed to load model {new_model}.")
+                    update_status(f"Failed to load model {new_model}.")
             except Exception as e:
-                safe_update_status(f"Error loading model: {e}")
+                update_status(f"Error loading model: {e}")
 
         threading.Thread(target=load_task, daemon=True).start()
 
@@ -354,7 +353,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
         save_switch_states()
 
         if WEBCAM_STOP_EVENT is not None:
-            safe_update_status("Stopping live preview...")
+            update_status("Stopping live preview...")
             WEBCAM_STOP_EVENT.set()
             ROOT.after(500, lambda: destroy_and_reload_model(new_model, restart_live=True))
         else:
@@ -745,21 +744,16 @@ def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
 
 
 def update_status(text: str) -> None:
-    # Tk may only be touched from the main thread. Worker threads (model
-    # loading in destroy_and_reload_model, face_swapper status messages) used
-    # to call configure()/update() directly while holding the face swapper
-    # lock, which deadlocked against a main-thread callback waiting for that
-    # lock (UI froze on model switch). Hand the update to the main loop.
+    # Tk only from the main thread: a worker calling configure()/update() while
+    # holding the face swapper lock deadlocked the UI on model switch. Even
+    # ROOT.after() is a Tcl call, so workers only enqueue.
     if threading.current_thread() is not threading.main_thread():
-        # Even ROOT.after() is a Tcl call that waits for the main thread, so
-        # workers only enqueue; _drain_status_queue() applies it.
-        _STATUS_QUEUE.put(text)
+        call_on_main(lambda: status_label.configure(text=_(text)))
         return
     status_label.configure(text=_(text))
     ROOT.update()
 
 
-_STATUS_QUEUE: "queue.SimpleQueue[str]" = queue.SimpleQueue()
 _MAIN_CALLS: "queue.SimpleQueue[Callable[[], None]]" = queue.SimpleQueue()
 
 
@@ -769,20 +763,9 @@ def call_on_main(fn: Callable[[], None]) -> None:
 
 
 def _drain_status_queue() -> None:
-    """Main-thread poller for status messages and calls posted by workers."""
-    last = None
-    while True:
-        try:
-            last = _STATUS_QUEUE.get_nowait()
-        except queue.Empty:
-            break
-    if last is not None:
-        status_label.configure(text=_(last))
-    while True:
-        try:
-            fn = _MAIN_CALLS.get_nowait()
-        except queue.Empty:
-            break
+    """Main-thread poller (100 ms) for work posted by worker threads."""
+    while not _MAIN_CALLS.empty():
+        fn = _MAIN_CALLS.get_nowait()
         try:
             fn()
         except Exception as e:  # keep the poller alive
@@ -1154,9 +1137,9 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
         """Pool for the hyperswap single-face fast path, ON BY DEFAULT (Faza 3.2).
 
         After moving all per-frame CPU work off the worker (GIL relief), the
-        ANE-only pool overlaps inference with detection/finalization and beats
-        the serial path with smooth, uniform pacing. --dual-session still adds a
-        second GPU worker (opt-in; bursty pacing, TODO.md 2.3). poisson_blend is
+        single-session pool (GPU) overlaps inference with detection and
+        finalization; PacedEmitter evens out the frame cadence. --dual-session
+        adds a second session on the ANE (opt-in, TODO.md 2.3). poisson_blend is
         excluded because the pool path carries no pre-swap full frame for it."""
         m = modules.globals.swapper_model
         return (m.startswith("hyperswap")
