@@ -969,12 +969,15 @@ def update_preview(frame_number: int = 0) -> None:
         temp_frame = get_video_frame(modules.globals.target_path, frame_number)
         if modules.globals.nsfw_filter and check_and_ignore_nsfw(temp_frame):
             return
+        source_img = cv2.imread(modules.globals.source_path)
+        if source_img is None:
+            update_status("Cannot read the source image.")
+            return
+        source_face = get_one_face(source_img)
         for frame_processor in get_frame_processors_modules(
                 modules.globals.frame_processors
         ):
-            temp_frame = frame_processor.process_frame(
-                get_one_face(cv2.imread(modules.globals.source_path)), temp_frame
-            )
+            temp_frame = frame_processor.process_frame(source_face, temp_frame)
         image = Image.fromarray(gpu_cvt_color(temp_frame, cv2.COLOR_BGR2RGB))
         image = ImageOps.contain(
             image, (PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT), Image.LANCZOS
@@ -1122,6 +1125,7 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
     enh_mod = next((fp for fp in frame_processors
                     if fp.NAME == "DLC.FACE-ENHANCER"), None)
     source_image = None
+    source_image_path = None
     prev_time = time.time()
     fps_update_interval = 0.5
     frame_count = 0
@@ -1240,8 +1244,12 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
         # --- 3. DETECTION / TRACKING (shared, always sequential) ---
         have_targets = False
         if not modules.globals.map_faces:
-            if source_image is None and modules.globals.source_path:
-                source_image = get_one_face(cv2.imread(modules.globals.source_path))
+            # Re-read when the user picks another source during Live (upstream fix);
+            # an unreadable file gives no source face instead of an exception.
+            if modules.globals.source_path != source_image_path:
+                source_image_path = modules.globals.source_path
+                img = cv2.imread(source_image_path) if source_image_path else None
+                source_image = get_one_face(img) if img is not None else None
 
             if run_detection:
                 if modules.globals.many_faces:

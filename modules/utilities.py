@@ -267,7 +267,8 @@ def clean_temp(target_path: str) -> None:
 
 
 def has_image_extension(image_path: str) -> bool:
-    return image_path.lower().endswith(("png", "jpg", "jpeg"))
+    # WebP support ported from upstream; splitext so "foo.notpng" does not match.
+    return os.path.splitext(image_path)[1].lower() in (".png", ".jpg", ".jpeg", ".webp")
 
 
 def is_image(image_path: str) -> bool:
