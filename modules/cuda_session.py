@@ -4,10 +4,10 @@ With some cuDNN builds (seen with cuDNN 9.27 on a Tesla T4, loaded into the
 process by ``import torch``), the default exhaustive conv-algorithm search
 finds no engine for some Conv layers ("No valid engine configs").
 onnxruntime then silently moves the whole session to the CPU at its first
-run: the face recognizer took 213 ms instead of 11 ms, SimSwap 614 instead of
-30. Here every CUDA session runs one dummy inference at load time with that
-fallback disabled; when it fails, the session is rebuilt with a cheaper
-algorithm search, which keeps it on the GPU.
+run (face recognizer ~200 ms, SimSwap ~610 ms per run). Here every CUDA
+session runs one dummy inference at load time with that fallback disabled;
+when it fails, the session is rebuilt with a cheaper algorithm search, which
+keeps it on the GPU (recognizer 17 ms, SimSwap 64 ms with DEFAULT).
 
 Sessions without the CUDA provider (CoreML, DirectML, CPU) are untouched.
 """
