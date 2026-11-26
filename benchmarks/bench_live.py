@@ -25,7 +25,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import modules.globals
 
 # Match the live defaults regardless of switch_states.json
-modules.globals.execution_providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+# DLC_PROVIDERS="CUDAExecutionProvider,CPUExecutionProvider" runs the bench on CUDA
+# (the --pool path is CoreML-only).
+modules.globals.execution_providers = os.environ.get(
+    "DLC_PROVIDERS", "CoreMLExecutionProvider,CPUExecutionProvider").split(",")
 modules.globals.many_faces = False
 modules.globals.map_faces = False
 modules.globals.mouth_mask = False
