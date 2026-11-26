@@ -42,6 +42,9 @@ def get_face_analyser() -> Any:
                     )
                     analyser.prepare(ctx_id=0, det_size=DET_SIZE)
                 _optimize_det_model(analyser, providers)
+                from modules.cuda_session import ensure_cuda
+                for model in analyser.models.values():
+                    ensure_cuda(model, providers)
                 # Publish only when fully built: a thread passing the unlocked
                 # check above must never see an unprepared analyser
                 # (upstream 5b2caad).

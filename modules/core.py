@@ -232,28 +232,37 @@ def prepare_cuda() -> None:
     """Make the CUDA execution provider actually start, or say why it cannot.
 
     onnxruntime lists CUDAExecutionProvider even when its CUDA/cuDNN libraries
-    are missing, and then silently runs every model on the CPU. Libraries
-    installed from pip (onnxruntime-gpu[cuda,cudnn]) are loaded first, then a
-    one-node session checks that the provider really starts."""
+    are missing, and then silently runs every model on the CPU. A one-node
+    session checks that the provider starts; if not, the libraries installed
+    from pip (onnxruntime-gpu[cuda,cudnn]) are loaded and it is checked again.
+    Per-model cuDNN conv failures are handled in modules/cuda_session.py."""
     if 'CUDAExecutionProvider' not in modules.globals.execution_providers:
         return
     import importlib.util
+    from onnx import TensorProto, helper
+    value = helper.make_tensor_value_info('x', TensorProto.FLOAT, [1])
+    graph = helper.make_graph([helper.make_node('Identity', ['x'], ['y'])], 'probe',
+                              [value], [helper.make_tensor_value_info('y', TensorProto.FLOAT, [1])])
+    probe = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 13)], ir_version=8).SerializeToString()
+
+    def cuda_starts() -> bool:
+        try:
+            session = onnxruntime.InferenceSession(probe, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            return 'CUDAExecutionProvider' in session.get_providers()
+        except Exception:
+            return False
+
+    # System CUDA/cuDNN first; the pip libraries only when that does not work
+    # (preloading them can replace a working system cuDNN).
+    if cuda_starts():
+        return
     if hasattr(onnxruntime, 'preload_dlls') and importlib.util.find_spec('nvidia') is not None:
         try:
             onnxruntime.preload_dlls()
         except Exception:
             pass
-    from onnx import TensorProto, helper
-    value = helper.make_tensor_value_info('x', TensorProto.FLOAT, [1])
-    graph = helper.make_graph([helper.make_node('Identity', ['x'], ['y'])], 'probe',
-                              [value], [helper.make_tensor_value_info('y', TensorProto.FLOAT, [1])])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 13)], ir_version=8)
-    try:
-        session = onnxruntime.InferenceSession(model.SerializeToString(), providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        if 'CUDAExecutionProvider' in session.get_providers():
+        if cuda_starts():
             return
-    except Exception:
-        pass
     gpu = ''
     try:
         import subprocess

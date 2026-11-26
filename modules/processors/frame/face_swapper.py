@@ -5,6 +5,7 @@ import threading
 import numpy as np
 import platform
 import modules.globals
+from modules.cuda_session import cuda_safe_session, ensure_cuda
 import modules.processors.frame.core
 from modules.core import update_status
 from modules.face_analyser import get_one_face, get_many_faces, default_source_face, FaceTracker
@@ -242,7 +243,7 @@ def _paste_back_roi(img, bgr_fake, crop_mask, IM, blur_mask=False):
 class HiFiFaceSwapper:
     def __init__(self, model_path: str, providers: list, provider_options: list = None):
         import onnxruntime as ort
-        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.session = cuda_safe_session(model_path, providers, provider_options=provider_options)
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
         self.input_size = (256, 256)
@@ -313,7 +314,7 @@ class HiFiFaceSwapper:
 class SimSwapSwapper:
     def __init__(self, model_path: str, providers: list, provider_options: list = None):
         import onnxruntime as ort
-        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.session = cuda_safe_session(model_path, providers, provider_options=provider_options)
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
         self.input_size = (256, 256)
@@ -386,7 +387,7 @@ class HyperSwapSwapper:
         # Drops the AdaIN Expand nodes that otherwise fall back to the CPU
         # (2 CoreML partitions -> 1); cached as <model>_coreml.onnx.
         model_path = optimize_for_coreml(model_path)
-        self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
+        self.session = cuda_safe_session(model_path, providers, provider_options=provider_options)
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]
         self.input_size = (256, 256)
@@ -642,6 +643,7 @@ def get_face_swapper() -> Any:
                         model_path,
                         providers=providers_config,
                     )
+                    ensure_cuda(FACE_SWAPPER, providers_config)
                     import types
                     FACE_SWAPPER.get = types.MethodType(optimized_swapper_get, FACE_SWAPPER)
                 update_status(f"Face swapper model ({model_name}) loaded successfully with CoreML M4 Pro optimizations.", NAME)

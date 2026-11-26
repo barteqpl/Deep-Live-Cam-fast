@@ -116,10 +116,8 @@ def create_onnx_session(model_path: str) -> onnxruntime.InferenceSession:
     session_options.graph_optimization_level = (
         onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
     )
-    session = onnxruntime.InferenceSession(
-        model_path, sess_options=session_options, providers=providers,
-    )
-    return session
+    from modules.cuda_session import cuda_safe_session
+    return cuda_safe_session(model_path, providers, sess_options=session_options)
 
 
 def warmup_session(session: onnxruntime.InferenceSession) -> None:
