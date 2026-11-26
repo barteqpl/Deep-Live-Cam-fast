@@ -40,7 +40,11 @@ class PacedEmitter:
         with self._cv:
             if self._last_in is not None:
                 dt = now - self._last_in
-                if self._ema is None:
+                if self._ema is not None and dt > max(4 * self._ema, 0.25):
+                    # Gap in arrivals (pool paused, first inference): restart
+                    # the estimate instead of pacing on a poisoned EMA.
+                    self._ema, self._jit, self._last_slot = None, 0.0, None
+                elif self._ema is None:
                     self._ema = dt
                 else:
                     self._jit += self.alpha * (abs(dt - self._ema) - self._jit)
@@ -52,7 +56,9 @@ class PacedEmitter:
             else:
                 nominal = self._last_slot + self._ema
                 slot = nominal + self.beta * (target - nominal)
-            slot = max(slot, now)
+            # Never before arrival, never further ahead than one interval
+            # past the jitter delay.
+            slot = min(max(slot, now), target + (self._ema or 0.0))
             self._last_slot = slot
             self._q.append((slot, item))
             self._cv.notify()
@@ -62,28 +68,24 @@ class PacedEmitter:
             with self._cv:
                 while not self._q and not self._stop:
                     self._cv.wait()
-                if not self._q and self._stop:
-                    return
+                if not self._q:
+                    return                  # stopped and drained
                 slot, item = self._q[0]
                 now = time.perf_counter()
-                if now < slot and len(self._q) <= self.max_hold and not self._stop:
+                if now < slot and len(self._q) <= self.max_hold:
                     self._cv.wait(timeout=slot - now)
                     continue
                 self._q.popleft()
-            self._sink(item)
-
-    def pending(self) -> int:
-        with self._cv:
-            return len(self._q)
+            try:
+                self._sink(item)
+            except Exception as e:  # a dead emitter would freeze the preview
+                print(f"[pacing] sink failed: {e}")
 
     def close(self, flush: bool = True) -> None:
-        """Stop the thread. With flush, held frames are emitted first (on schedule)."""
-        if flush:
-            while self.pending():
-                time.sleep(0.001)
+        """Stop the thread. With flush, held frames are still emitted on schedule."""
         with self._cv:
             self._stop = True
             if not flush:
                 self._q.clear()
             self._cv.notify()
-        self._thread.join(timeout=1.0)
+        self._thread.join(timeout=2.0)

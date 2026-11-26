@@ -31,6 +31,7 @@ is paid only once per model.
 
 import os
 import platform
+import threading
 
 import numpy as np
 
@@ -96,7 +97,11 @@ def optimize_for_coreml(model_path: str, input_shape: tuple = None) -> str:
     # had a (512, 512) matrix as its last initializer, keep it last.
     _preserve_emap_position(model, numpy_helper)
 
-    onnx.save(model, optimized_path)
+    # Write then rename: a concurrent loader or an interrupted save never sees
+    # a half-written cache file.
+    tmp = f"{optimized_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    onnx.save(model, tmp)
+    os.replace(tmp, optimized_path)
     return optimized_path
 
 
@@ -135,7 +140,8 @@ def _drop_broadcast_expand(model) -> bool:
         if n.op_type != "Expand" or len(n.input) != 2:
             continue
         shp = producer.get(n.input[1])
-        if shp is None or shp.op_type != "Shape" or len(shp.input) != 1:
+        # Shape(start/end) would yield a partial shape: not a pure broadcast.
+        if shp is None or shp.op_type != "Shape" or len(shp.input) != 1 or shp.attribute:
             continue
         y = shp.input[0]
         e = n.output[0]

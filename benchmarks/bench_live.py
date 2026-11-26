@@ -312,7 +312,7 @@ def _run_pool(args, frames, source_face, enhancer_mod):
     total = time.perf_counter() - total_t0
     pool.stop()
 
-    tag = "ANE+GPU" if args.dual_session else "ANE-only"
+    tag = "GPU+ANE" if args.dual_session else "GPU"
     print(f"\n=== bench_live results (--pool {tag}, {n} frames, warmup {WARMUP}) ===")
     print(f"FPS: {n / total:.2f}   total {total*1000:.0f} ms   "
           f"{total/n*1000:.2f} ms/frame")

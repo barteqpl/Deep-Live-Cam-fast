@@ -2,8 +2,8 @@
 
 Runs N HyperSwapSwapper instances (each with its OWN onnxruntime session and
 per-instance lock) on different CoreML compute units, consuming swap jobs from
-a shared queue with greedy dispatch: the fast ANE worker naturally takes ~2.5x
-more frames than the (optional) GPU worker.
+a shared queue with greedy dispatch. The primary session runs on the GPU; the
+optional second session (--dual-session) runs on the ANE.
 
 Faza 3.2 change — GIL relief. Workers used to call the FULL swap_face()
 (~10-15 ms of numpy/cv2 CPU work per frame under the GIL), which starved the

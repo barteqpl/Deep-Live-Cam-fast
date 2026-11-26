@@ -763,14 +763,13 @@ def call_on_main(fn: Callable[[], None]) -> None:
 
 
 def _drain_status_queue() -> None:
-    """Main-thread poller (100 ms) for work posted by worker threads."""
-    while not _MAIN_CALLS.empty():
-        fn = _MAIN_CALLS.get_nowait()
-        try:
-            fn()
-        except Exception as e:  # keep the poller alive
-            print(f"[DLC.UI] main-thread call failed: {e}")
+    """Main-thread poller (100 ms) for work posted by worker threads.
+
+    Reschedules first and runs each call as its own Tk event, so a call that
+    blocks (webcam_preview runs a ROOT.update() loop) does not stop the poller."""
     ROOT.after(100, _drain_status_queue)
+    while not _MAIN_CALLS.empty():
+        ROOT.after(0, _MAIN_CALLS.get_nowait())
 
 
 def update_pop_status(text: str) -> None:
@@ -1322,13 +1321,20 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                     else:
                         temp_frame = frame_processor.process_frame(source_image, temp_frame)
 
-            # Legacy path also handles FPS and push inline
-            _push_processed(temp_frame)
-
-        # Legacy path does its own push above; pool path pushes in the drain.
-        # After either path, loop back.
+            # Once a pool exists, its frames may still be held in the pacer:
+            # emit through it too, so output stays ordered and single-threaded.
+            if pool is not None:
+                pacer.push(temp_frame)
+            else:
+                _push_processed(temp_frame)
 
     pacer.close(flush=False)
+    # Stop our own pool too: Live may have been stopped while _ensure_pool was
+    # still compiling, after create_webcam_preview stopped waiting for us.
+    if pool is not None:
+        pool.stop()
+        if modules.globals.swapper_pool is pool:
+            modules.globals.swapper_pool = None
 
 
 def create_webcam_preview(camera_index: int):
