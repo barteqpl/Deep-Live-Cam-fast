@@ -43,7 +43,24 @@ Times `session.run` of simswap / hififace / hyperswap across CoreML configs
 (GPU vs Neural Engine). Add `--optimized` to route through
 `optimize_for_coreml` first, or a model name to test one variant.
 
-## Reference results (Apple M4 Pro, 960x540)
+## Fast 1.1.0 results (Apple M4 Pro 48 GB, macOS 26, onnxruntime 1.27, 960x540)
+
+`bench_live.py --frames 120` on the gif-derived clip. 1.0.4 (3994ddf) and
+1.1.0 are separate checkouts, run interleaved (ABBA, 6 pairs per suite, fresh
+process per run, one warm-up per side). Medians:
+
+| Suite | 1.0.4 | 1.1.0 | Change |
+|---|---|---|---|
+| hyperswap-1b `--pool` (live default) | 18.54 | 47.59 | +157%, p95/p50 1.12 -> 1.10 |
+| hyperswap-1b serial | 16.11 | 36.72 | +128% |
+| simswap | 34.63 | 34.94 | +0.9% |
+
+HyperSwap raw inference on GPU: 32.2 -> 18.9 ms once the AdaIN `Expand` nodes
+are dropped (`_drop_broadcast_expand`, one CoreML partition instead of two);
+after that the GPU beats the ANE in the live pipeline. Swapped frame vs 1.0.4:
+PSNR 75.5 dB (fp16 rounding only). The tables below predate this change.
+
+## Reference results (Apple M4 Pro, 960x540, before 1.1.0)
 
 Per-model raw inference and full-pipeline FPS (`bench_live.py --model ...`):
 
@@ -80,8 +97,8 @@ Findings:
   ms/frame on GPU (and 716 ms on ANE — never route it there). The live path
   now defaults to GPEN-BFR-256 (~50 ms, `--live-enhancer` to override); file
   processing keeps GFPGAN-512 for quality.
-- Dead ends (measured, don't retry): `optimize_for_coreml` on hyperswap is a
-  no-op; hyperswap weights are already fp16 internally (onnxconverter refuses
+- Dead ends (measured, don't retry; superseded in 1.1.0, see the top
+  section): `optimize_for_coreml` on hyperswap is a no-op; hyperswap weights are already fp16 internally (onnxconverter refuses
   a second conversion); hyperswap on GPU is ~140 ms (2x slower than ANE).
 - Mouth masking costs ~1.4% FPS (landmark model +3.7 ms on detection frames
   only, every `DETECT_EVERY_N`), and only when the switch is on.

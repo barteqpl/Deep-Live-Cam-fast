@@ -14,8 +14,78 @@
 
 ## Fast edition — what's different in this fork
 
-This fork optimizes the **live webcam pipeline for Apple Silicon** (developed
-and measured on an M4 Pro). Version 1.0.4 highlights:
+This fork optimizes the **live webcam pipeline for Apple Silicon**. Version 1.1.0
+was developed and measured on an **Apple M4 Pro (48 GB), macOS 26,
+onnxruntime 1.27 (CoreML EP), Python 3.11**.
+
+### Version 1.1.0
+
+**HyperSwap 1b live: 18.5 → 47.6 FPS (+157%)** in the headless live-pipeline
+benchmark (`benchmarks/bench_live.py`, 960x540, 120 frames), against 1.0.4
+on the same machine. In a real session the preview runs at the camera's 30 FPS
+cap.
+
+| Suite (bench_live, 960x540) | 1.0.4 | 1.1.0 | Change |
+|---|---|---|---|
+| HyperSwap 1b, pipelined pool (live default) | 18.54 FPS | 47.59 FPS | +157% |
+| HyperSwap 1b, serial | 16.11 FPS | 36.72 FPS | +128% |
+| SimSwap 256 (default model) | 34.63 FPS | 34.94 FPS | +0.9% (unchanged) |
+
+How it was measured: 1.0.4 and 1.1.0 are separate checkouts, run interleaved
+(ABBA order, 6 pairs per suite, each run a fresh process, one warm-up run per
+side). The table shows medians. Frame-time spread (p95/p50) of the pool went
+from 1.12 to 1.10. The swapped frame differs from 1.0.4 only by fp16 rounding
+(PSNR 75.5 dB). The numbers are for this machine only; other Macs will differ.
+
+What changed:
+
+- **The whole HyperSwap graph now runs inside CoreML.** HyperSwap's AdaIN
+  blocks use `Expand(style, Shape(x))` before a broadcasting `Mul`/`Add`.
+  The CoreML EP cannot run an `Expand` with a runtime shape, so 42 nodes fell
+  back to the CPU, and the graph was split into 2 partitions with copies
+  between them. A new load-time pass (`modules/onnx_optimize.py`,
+  `_drop_broadcast_expand`) removes those no-op `Expand` nodes, which leaves
+  one partition. Raw inference: 32.2 → 18.9 ms. The rewritten model is cached
+  as `<model>_coreml.onnx` (written atomically).
+- **HyperSwap runs on the GPU instead of the Neural Engine** (live pool and
+  serial path). After the change above, the GPU is the faster unit in the live
+  pipeline. `--dual-session` still adds a second session, which is now the ANE
+  one (opt-in, off by default).
+- **Paced output (jitter buffer).** Frames from the pipelined pool finish
+  unevenly, because a detection frame takes longer than a tracked frame.
+  `modules/pacing.py` emits them on a steady cadence from its own thread, at
+  most 3 frames deep. This adds a few ms of latency and costs no throughput.
+  After a pause in the stream the cadence estimate restarts instead of
+  drifting.
+- **Fixed: the app froze when switching the model during Live.** Worker
+  threads called Tk (status label, `ROOT.after`, `StringVar.get`) while the
+  main thread waited for the model lock. Workers now only enqueue, and the Tk
+  main thread applies the updates.
+- **Quiet console on macOS.** At startup the console no longer shows:
+  - the five `GetPrototype` protobuf errors (TensorFlow is no longer imported at
+    startup on macOS; it only set CUDA memory growth);
+  - OpenCV `out device of bound` and Orbbec SDK / OBSENSOR camera-probe noise
+    (camera probing and capture use AVFoundation only);
+  - insightface's per-model prints.
+- **Safer model downloads.** TLS is verified with the certifi CA bundle
+  (before, certificate checks were turned off on macOS). Downloads go to `<file>.part`
+  and are renamed only when complete, so an interrupted download no longer
+  leaves a broken model.
+- **Fixes ported from upstream Deep-Live-Cam:**
+  - face-cluster count bounded by the available embeddings, and empty
+    clusters skipped (map faces);
+  - video frame seek clamped to the clip length;
+  - fps fallback when ffprobe fails;
+  - the face analyser is published only after it is fully prepared;
+  - Live picks up a new source image without a restart, and an unreadable
+    source no longer crashes the processing thread;
+  - WebP accepted as image input.
+- **CUDA / Linux / Windows:** the pipelined pool and the graph pass are
+  CoreML-only. On other execution providers, Live keeps the serial path with
+  the user's providers. (Before, the pool could start CoreML sessions on a CUDA
+  machine and silently run on the CPU.)
+
+Version 1.0.4:
 
 - **Cleaner blending** — the paste-back mask is a narrow, strongly-feathered
   core-face ellipse that excludes the ears (no more ghost "ear on ear" when
