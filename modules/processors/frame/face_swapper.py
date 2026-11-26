@@ -382,6 +382,10 @@ class HyperSwapSwapper:
     Uses arcface_128 template, mean/std = [0.5, 0.5, 0.5], normed_embedding directly."""
     def __init__(self, model_path: str, providers: list, provider_options: list = None):
         import onnxruntime as ort
+        from modules.onnx_optimize import optimize_for_coreml
+        # Drops the AdaIN Expand nodes that otherwise fall back to the CPU
+        # (2 CoreML partitions -> 1); cached as <model>_coreml.onnx.
+        model_path = optimize_for_coreml(model_path)
         self.session = ort.InferenceSession(model_path, providers=providers, provider_options=provider_options)
         self.input_names = [inp.name for inp in self.session.get_inputs()]
         self.output_names = [out.name for out in self.session.get_outputs()]

@@ -82,6 +82,12 @@ def optimize_for_coreml(model_path: str, input_shape: tuple = None) -> str:
     if _rewrite_scalar_gather(model):
         changed = True
 
+    # CoreML EP rejects Expand with a runtime shape; in AdaIN-style blocks
+    # (hyperswap) Expand(style, Shape(x)) only feeds a broadcasting Mul/Add,
+    # so it is a no-op that pushes 42 nodes to the CPU. Drop it.
+    if _drop_broadcast_expand(model):
+        changed = True
+
     if not changed:
         return model_path
 
@@ -92,6 +98,75 @@ def optimize_for_coreml(model_path: str, input_shape: tuple = None) -> str:
 
     onnx.save(model, optimized_path)
     return optimized_path
+
+
+# ---------------------------------------------------------------------------
+# Pass: drop Expand(x, Shape(y)) that only feeds broadcasting elementwise ops
+# ---------------------------------------------------------------------------
+
+_BROADCAST_OPS = {"Mul", "Add", "Sub", "Div"}
+
+
+def _drop_broadcast_expand(model) -> bool:
+    """Remove Expand nodes whose result is re-broadcast anyway.
+
+    Pattern: ``e = Expand(x, Shape(y))`` where every consumer of ``e`` is a
+    broadcasting elementwise op whose other operand is ``y`` itself or the
+    output of an elementwise op that takes ``y``. The consumer then
+    broadcasts ``x`` to ``y``'s shape on its own, so feeding ``x`` directly
+    is exact.
+    """
+    g = model.graph
+    producer = {o: n for n in g.node for o in n.output}
+    consumers = {}
+    for n in g.node:
+        for i in n.input:
+            consumers.setdefault(i, []).append(n)
+
+    def shaped_like(t, y):
+        if t == y:
+            return True
+        p = producer.get(t)
+        return p is not None and p.op_type in _BROADCAST_OPS and y in p.input
+
+    drop = []
+    for n in g.node:
+        if n.op_type != "Expand" or len(n.input) != 2:
+            continue
+        shp = producer.get(n.input[1])
+        if shp is None or shp.op_type != "Shape" or len(shp.input) != 1:
+            continue
+        y = shp.input[0]
+        users = consumers.get(n.output[0], [])
+        if not users or any(u.op_type not in _BROADCAST_OPS for u in users):
+            continue
+        ok = True
+        for u in users:
+            others = [i for i in u.input if i != n.output[0]]
+            if len(others) != 1 or not shaped_like(others[0], y):
+                ok = False
+                break
+        if not ok or any(o.name == n.output[0] for o in g.output):
+            continue
+        drop.append((n, shp, users))
+
+    if not drop:
+        return False
+    dead = set()
+    for n, shp, users in drop:
+        for u in users:
+            for k, i in enumerate(u.input):
+                if i == n.output[0]:
+                    u.input[k] = n.input[0]
+        dead.add(id(n))
+    still_used = {i for n in g.node if id(n) not in dead for i in n.input}
+    for n, shp, _ in drop:
+        if shp.output[0] not in still_used:
+            dead.add(id(shp))
+    keep = [n for n in g.node if id(n) not in dead]
+    del g.node[:]
+    g.node.extend(keep)
+    return True
 
 
 # ---------------------------------------------------------------------------
