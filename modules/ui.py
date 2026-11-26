@@ -96,6 +96,7 @@ def init(start: Callable[[], None], destroy: Callable[[], None], lang: str) -> c
     lang_manager = LanguageManager(lang)
     _ = lang_manager._
     ROOT = create_root(start, destroy)
+    ROOT.after(100, _drain_status_queue)
     PREVIEW = create_preview(ROOT)
 
     return ROOT
@@ -313,10 +314,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
 
     # --- Model Selection ---
     def safe_update_status(text: str) -> None:
-        if threading.current_thread() is threading.main_thread():
-            update_status(text)
-        else:
-            ROOT.after(0, lambda: update_status(text))
+        update_status(text)  # thread-safe: workers enqueue, see update_status
 
     def destroy_and_reload_model(new_model: str, restart_live: bool = False):
         safe_update_status("Destroying model session...")
@@ -340,7 +338,7 @@ def create_root(start: Callable[[], None], destroy: Callable[[], None]) -> ctk.C
                             cam_name = CAMERA_VARIABLE.get() if CAMERA_VARIABLE else None
                             cam_idx = CAMERA_INDICES[CAMERA_NAMES.index(cam_name)] if CAMERA_NAMES and cam_name and cam_name != "No cameras found" else None
                             if cam_idx is not None:
-                                ROOT.after(100, lambda: webcam_preview(ROOT, cam_idx))
+                                call_on_main(lambda: webcam_preview(ROOT, cam_idx))
                         except Exception as e:
                             safe_update_status(f"Error restarting live preview: {e}")
                 else:
@@ -747,8 +745,49 @@ def create_preview(parent: ctk.CTkToplevel) -> ctk.CTkToplevel:
 
 
 def update_status(text: str) -> None:
+    # Tk may only be touched from the main thread. Worker threads (model
+    # loading in destroy_and_reload_model, face_swapper status messages) used
+    # to call configure()/update() directly while holding the face swapper
+    # lock, which deadlocked against a main-thread callback waiting for that
+    # lock (UI froze on model switch). Hand the update to the main loop.
+    if threading.current_thread() is not threading.main_thread():
+        # Even ROOT.after() is a Tcl call that waits for the main thread, so
+        # workers only enqueue; _drain_status_queue() applies it.
+        _STATUS_QUEUE.put(text)
+        return
     status_label.configure(text=_(text))
     ROOT.update()
+
+
+_STATUS_QUEUE: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+_MAIN_CALLS: "queue.SimpleQueue[Callable[[], None]]" = queue.SimpleQueue()
+
+
+def call_on_main(fn: Callable[[], None]) -> None:
+    """Run fn on the Tk main thread. Safe from any thread (no Tcl call here)."""
+    _MAIN_CALLS.put(fn)
+
+
+def _drain_status_queue() -> None:
+    """Main-thread poller for status messages and calls posted by workers."""
+    last = None
+    while True:
+        try:
+            last = _STATUS_QUEUE.get_nowait()
+        except queue.Empty:
+            break
+    if last is not None:
+        status_label.configure(text=_(last))
+    while True:
+        try:
+            fn = _MAIN_CALLS.get_nowait()
+        except queue.Empty:
+            break
+        try:
+            fn()
+        except Exception as e:  # keep the poller alive
+            print(f"[DLC.UI] main-thread call failed: {e}")
+    ROOT.after(100, _drain_status_queue)
 
 
 def update_pop_status(text: str) -> None:
