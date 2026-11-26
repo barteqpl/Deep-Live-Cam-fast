@@ -1,0 +1,5 @@
+-r requirements-base.txt
+# CUDA 12 build for older NVIDIA GPUs (Maxwell/Pascal/Volta, e.g. GTX 10xx)
+# or drivers below 580. 1.26 is the last onnxruntime-gpu built for CUDA 12.
+onnxruntime==1.27.0; sys_platform == 'darwin'
+onnxruntime-gpu[cuda,cudnn]==1.26.0; sys_platform != 'darwin'

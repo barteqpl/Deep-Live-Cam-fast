@@ -80,6 +80,12 @@ What changed:
   - Live picks up a new source image without a restart, and an unreadable
     source no longer crashes the processing thread;
   - WebP accepted as image input.
+- **CUDA: current onnxruntime, older GPUs still supported.**
+  `requirements.txt` now installs `onnxruntime-gpu` 1.32 (CUDA 13, driver
+  580+, RTX 20xx/T4 or newer) with CUDA and cuDNN from pip. Older GPUs and
+  drivers use `requirements-cuda12.txt` (1.26, CUDA 12). At startup the app
+  loads the pip CUDA libraries and checks that the CUDA provider really
+  starts; if not, it prints the reason and the file to install.
 - **CUDA / Linux / Windows:** the pipelined pool and the graph pass are
   CoreML-only. On other execution providers, Live keeps the serial path with
   the user's providers. (Before, the pool could start CoreML sessions on a CUDA
@@ -344,12 +350,18 @@ Choose the acceleration provider matching your hardware:
 
 #### 🟢 Nvidia — CUDA Acceleration
 
-1.  Install [CUDA Toolkit 12.x](https://developer.nvidia.com/cuda-toolkit) and [cuDNN v8.9+](https://developer.nvidia.com/cudnn).
-2.  Install CUDA-accelerated ONNX runtime:
+1.  `pip install -r requirements.txt` installs `onnxruntime-gpu` 1.32 with
+    CUDA 13 and cuDNN 9 from pip, so no CUDA Toolkit install is needed. It
+    needs NVIDIA driver 580+ and a Turing (RTX 20xx, T4) or newer GPU.
+2.  Older GPU (GTX 9xx/10xx, Volta) or driver below 580: install the CUDA 12
+    build instead (`onnxruntime-gpu` 1.26, the last one built for CUDA 12):
     ```bash
-    pip uninstall onnxruntime onnxruntime-gpu
-    pip install onnxruntime-gpu==1.23.2
+    pip uninstall -y onnxruntime-gpu
+    pip install -r requirements-cuda12.txt
     ```
+    At startup the app loads the pip CUDA libraries and checks that the CUDA
+    provider really starts. If it does not, it says why and which file to
+    install, instead of silently running on the CPU.
 3.  Run the application:
     ```bash
     python run.py --execution-provider cuda

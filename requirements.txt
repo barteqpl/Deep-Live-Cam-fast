@@ -1,24 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cu128
-
-numpy>=1.23.5,<2
-typing-extensions>=4.8.0
-opencv-python==4.10.0.84
-cv2_enumerate_cameras==1.1.15
-onnx==1.18.0
-insightface==0.7.3
-psutil==5.9.8
-tk==0.1.0
-customtkinter==5.2.2
-pillow==11.1.0
-torch; sys_platform != 'darwin'
-torch; sys_platform == 'darwin'
-torchvision; sys_platform != 'darwin'
-torchvision; sys_platform == 'darwin'
+-r requirements-base.txt
+# onnxruntime-gpu >= 1.27 is built for CUDA 13: NVIDIA driver 580+ and a Turing
+# (RTX 20xx, T4) or newer GPU. CUDA and cuDNN come from pip ([cuda,cudnn]).
+# Older GPU (GTX 9xx/10xx, Volta) or driver: use requirements-cuda12.txt.
 onnxruntime==1.27.0; sys_platform == 'darwin'
-onnxruntime-gpu==1.22.0; sys_platform != 'darwin'
-tensorflow; sys_platform != 'darwin'
-opennsfw2==0.10.2
-protobuf==4.25.8
-pygrabber; sys_platform == 'win32'
-certifi>=2024.7.4
-tqdm>=4.66.3
+onnxruntime-gpu[cuda,cudnn]==1.32.0; sys_platform != 'darwin'

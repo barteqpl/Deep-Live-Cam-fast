@@ -228,6 +228,47 @@ def pre_check() -> bool:
     return True
 
 
+def prepare_cuda() -> None:
+    """Make the CUDA execution provider actually start, or say why it cannot.
+
+    onnxruntime lists CUDAExecutionProvider even when its CUDA/cuDNN libraries
+    are missing, and then silently runs every model on the CPU. Libraries
+    installed from pip (onnxruntime-gpu[cuda,cudnn]) are loaded first, then a
+    one-node session checks that the provider really starts."""
+    if 'CUDAExecutionProvider' not in modules.globals.execution_providers:
+        return
+    import importlib.util
+    if hasattr(onnxruntime, 'preload_dlls') and importlib.util.find_spec('nvidia') is not None:
+        try:
+            onnxruntime.preload_dlls()
+        except Exception:
+            pass
+    from onnx import TensorProto, helper
+    value = helper.make_tensor_value_info('x', TensorProto.FLOAT, [1])
+    graph = helper.make_graph([helper.make_node('Identity', ['x'], ['y'])], 'probe',
+                              [value], [helper.make_tensor_value_info('y', TensorProto.FLOAT, [1])])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid('', 13)], ir_version=8)
+    try:
+        session = onnxruntime.InferenceSession(model.SerializeToString(), providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        if 'CUDAExecutionProvider' in session.get_providers():
+            return
+    except Exception:
+        pass
+    gpu = ''
+    try:
+        import subprocess
+        gpu = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version,compute_cap', '--format=csv,noheader'],
+                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()[0]
+    except Exception:
+        pass
+    ort_minor = int(onnxruntime.__version__.split('.')[1])
+    hint = ('onnxruntime-gpu >= 1.27 needs CUDA 13 (driver 580+, RTX 20xx/T4 or newer); '
+            'for an older GPU or driver run: pip install -r requirements-cuda12.txt') if ort_minor >= 27 else \
+           'install the CUDA 12 runtime from pip: pip install -r requirements-cuda12.txt'
+    update_status(f'CUDA execution provider failed to load (onnxruntime-gpu {onnxruntime.__version__}'
+                  f'{", GPU " + gpu if gpu else ""}), models will run on the CPU. {hint}')
+
+
 def update_status(message: str, scope: str = 'DLC.CORE') -> None:
     print(f'[{scope}] {message}')
     if not modules.globals.headless:
@@ -363,6 +404,7 @@ def run() -> None:
     parse_args()
     if not pre_check():
         return
+    prepare_cuda()
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_check():
             return
