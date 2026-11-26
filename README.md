@@ -80,6 +80,15 @@ What changed:
   - Live picks up a new source image without a restart, and an unreadable
     source no longer crashes the processing thread;
   - WebP accepted as image input.
+- **CUDA: models no longer fall back to the CPU silently.** With some cuDNN
+  builds (seen: cuDNN 9.27, which `import torch` loads, on a Tesla T4) the
+  default exhaustive conv-algorithm search finds no engine for some layers,
+  and onnxruntime quietly moved the face recognizer and SimSwap to the CPU
+  (recognizer 213 vs 11 ms, SimSwap 614 vs 30 ms). Each CUDA session now runs
+  one test inference at load and, if needed, switches to another conv search
+  and stays on the GPU. Headless video swap on a Kaggle T4 (84 frames,
+  960x540): 0.4-0.8 → 3.4-4.9 frames/s for inswapper, SimSwap and HyperSwap,
+  with onnxruntime-gpu 1.26 and 1.32 alike. This affected upstream too.
 - **CUDA: current onnxruntime, older GPUs still supported.**
   `requirements.txt` now installs `onnxruntime-gpu` 1.32 (CUDA 13, driver
   580+, RTX 20xx/T4 or newer) with CUDA and cuDNN from pip. Older GPUs and
