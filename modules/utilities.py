@@ -1,7 +1,6 @@
 import glob
 import mimetypes
 import os
-import platform
 import shutil
 import urllib.request
 import ssl
@@ -286,36 +285,38 @@ def is_video(video_path: str) -> bool:
 
 
 def conditional_download(download_directory_path: str, urls: List[str]) -> None:
-    if not os.path.exists(download_directory_path):
-        os.makedirs(download_directory_path)
+    """Download missing model files with verified TLS (certifi CA bundle).
+
+    The file is written to ``<name>.part`` and renamed only when complete, so
+    an interrupted download is not mistaken for a present model on the next
+    run. Previously macOS disabled certificate verification, which let anyone
+    on the network path replace a model file (executed by onnxruntime).
+    """
+    import certifi
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    os.makedirs(download_directory_path, exist_ok=True)
     for url in urls:
-        download_file_path = os.path.join(
-            download_directory_path, os.path.basename(url)
-        )
-        if not os.path.exists(download_file_path):
-            request = urllib.request.Request(url)
-            
-            # Create a specific SSL context for macOS to avoid globally disabling verification
-            ctx = None
-            if platform.system().lower() == "darwin":
-                ctx = ssl._create_unverified_context()
-                
-            response = urllib.request.urlopen(request, context=ctx)
-            total = int(response.headers.get("Content-Length", 0))
-            with tqdm(
-                total=total,
-                desc="Downloading",
-                unit="B",
-                unit_scale=True,
-                unit_divisor=1024,
-            ) as progress:
-                with open(download_file_path, "wb") as f:
-                    while True:
-                        buffer = response.read(8192)
-                        if not buffer:
-                            break
+        path = os.path.join(download_directory_path, os.path.basename(url))
+        if os.path.exists(path):
+            continue
+        part = path + ".part"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url), context=ctx) as response:
+                total = int(response.headers.get("Content-Length", 0))
+                done = 0
+                with tqdm(total=total, desc="Downloading", unit="B", unit_scale=True,
+                          unit_divisor=1024) as progress, open(part, "wb") as f:
+                    while buffer := response.read(1 << 16):
                         f.write(buffer)
+                        done += len(buffer)
                         progress.update(len(buffer))
+            if total and done != total:
+                raise IOError(f"incomplete download of {url}: {done} of {total} bytes")
+            os.replace(part, path)
+        except BaseException:
+            if os.path.exists(part):
+                os.remove(part)
+            raise
 
 
 def resolve_relative_path(path: str) -> str:
