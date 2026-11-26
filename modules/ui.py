@@ -1142,7 +1142,10 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
         adds a second session on the ANE (opt-in, TODO.md 2.3). poisson_blend is
         excluded because the pool path carries no pre-swap full frame for it."""
         m = modules.globals.swapper_model
-        return (m.startswith("hyperswap")
+        # The pool builds CoreML sessions; on CUDA/CPU the serial path keeps
+        # the user's execution providers.
+        return ("CoreMLExecutionProvider" in modules.globals.execution_providers
+                and m.startswith("hyperswap")
                 and not modules.globals.map_faces
                 and not modules.globals.many_faces
                 and not modules.globals.poisson_blend)
