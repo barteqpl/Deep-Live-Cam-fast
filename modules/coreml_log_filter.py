@@ -26,6 +26,10 @@ _BENIGN_MARKERS = (
     b"has unbounded dimension which is not supported",
     b"Failed to PropagateInputTensorShapes",
     b"MILCompilerForANE",
+    # OpenCV AVFoundation probing a camera index that does not exist
+    # (camera enumeration stops at the first failure).
+    b"OpenCV: out device of bound",
+    b"OpenCV: camera failed to properly initialize",
 )
 
 

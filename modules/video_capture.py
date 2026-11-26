@@ -72,8 +72,10 @@ class VideoCapturer:
                     except Exception:
                         continue
             else:
-                # Unix-like systems (Linux/Mac) capture method
-                self.cap = cv2.VideoCapture(self.device_index)
+                # Unix-like systems (Linux/Mac) capture method. On macOS use
+                # AVFoundation explicitly (CAP_ANY also tries OBSENSOR).
+                backend = cv2.CAP_AVFOUNDATION if platform.system() == "Darwin" else cv2.CAP_ANY
+                self.cap = cv2.VideoCapture(self.device_index, backend)
 
             if not self.cap or not self.cap.isOpened():
                 raise RuntimeError("Failed to open camera")

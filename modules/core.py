@@ -17,11 +17,16 @@ try:
 except ImportError:
     HAS_TORCH = False
 import onnxruntime
-try:
-    import tensorflow
-    HAS_TENSORFLOW = True
-except ImportError:
-    HAS_TENSORFLOW = False
+# TensorFlow is only used to enable CUDA memory growth (limit_resources). On
+# macOS it does nothing useful, and a stray TF install next to protobuf>=5
+# prints "MessageFactory has no attribute GetPrototype" errors at import.
+HAS_TENSORFLOW = False
+if sys.platform != 'darwin':
+    try:
+        import tensorflow
+        HAS_TENSORFLOW = True
+    except ImportError:
+        pass
 
 import modules.globals
 import modules.metadata

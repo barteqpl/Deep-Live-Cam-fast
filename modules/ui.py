@@ -1065,20 +1065,17 @@ def get_available_cameras():
         camera_names = []
 
         if platform.system() == "Darwin":  # macOS specific handling
-            # Try to open the default FaceTime camera first
-            cap = cv2.VideoCapture(0)
-            if cap.isOpened():
-                camera_indices.append(0)
-                camera_names.append("FaceTime Camera")
+            # AVFoundation only: CAP_ANY falls through to the OBSENSOR (Orbbec
+            # SDK) backend on a failed index and floods the console. AVFoundation
+            # indices are contiguous, so stop at the first one that fails.
+            for i in range(4):
+                cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
+                opened = cap.isOpened()
                 cap.release()
-
-            # On macOS, additional cameras typically use indices 1 and 2
-            for i in [1, 2]:
-                cap = cv2.VideoCapture(i)
-                if cap.isOpened():
-                    camera_indices.append(i)
-                    camera_names.append(f"Camera {i}")
-                    cap.release()
+                if not opened:
+                    break
+                camera_indices.append(i)
+                camera_names.append("FaceTime Camera" if i == 0 else f"Camera {i}")
         else:
             # Linux camera detection - test first 10 indices
             for i in range(10):

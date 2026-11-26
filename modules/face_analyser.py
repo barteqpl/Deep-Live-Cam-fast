@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import shutil
 from typing import Any
@@ -30,12 +32,15 @@ def get_face_analyser() -> Any:
                     build_provider_config,
                 )
                 providers = build_provider_config()
-                FACE_ANALYSER = insightface.app.FaceAnalysis(
-                    name='buffalo_l',
-                    providers=providers,
-                    allowed_modules=['detection', 'recognition', 'landmark_2d_106']
-                )
-                FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE)
+                # insightface prints one diagnostic line per model file
+                # ("Applied providers", "find model", "model ignore", ...).
+                with contextlib.redirect_stdout(io.StringIO()):
+                    FACE_ANALYSER = insightface.app.FaceAnalysis(
+                        name='buffalo_l',
+                        providers=providers,
+                        allowed_modules=['detection', 'recognition', 'landmark_2d_106']
+                    )
+                    FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE)
                 _optimize_det_model(FACE_ANALYSER, providers)
     return FACE_ANALYSER
 
