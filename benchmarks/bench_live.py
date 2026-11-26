@@ -208,6 +208,17 @@ def _run_pool(args, frames, source_face, enhancer_mod):
     n_track_total = 0
     intervals = []          # per-emitted-frame wall interval (ms), post-warmup
     last_emit = None
+    from modules.pacing import PacedEmitter
+    emit_state = {"last": None}
+
+    def _emit(_item):
+        # Runs on the emitter thread, like ui.py's paced _push_processed.
+        now = time.perf_counter()
+        if emit_state["last"] is not None:
+            intervals.append((now - emit_state["last"]) * 1000.0)
+        emit_state["last"] = now
+
+    pacer = PacedEmitter(_emit)   # mirrors ui.py paced emission
 
     def _drain():
         nonlocal collected, total_t0, detect_timer, track_timer
@@ -239,10 +250,7 @@ def _run_pool(args, frames, source_face, enhancer_mod):
                 p_bboxes = [res.bbox] if res.bbox is not None else []
                 out_f = fs.apply_post_processing(out_f, p_bboxes)
                 stages["post"] += time.perf_counter() - t0
-                now = time.perf_counter()
-                if last_emit is not None:
-                    intervals.append((now - last_emit) * 1000.0)
-                last_emit = now
+                pacer.push(True)
             # Save keyed on the SUBMIT index (res.idx), not the collected
             # counter, so it matches the serial path's frames[WARMUP+30] exactly
             # (serial saves at loop index i == WARMUP+30). Same source frame ->
@@ -294,11 +302,12 @@ def _run_pool(args, frames, source_face, enhancer_mod):
         submitted += 1
         _drain()
 
-    # Drain remaining
+    # Drain remaining, then flush the pacer (emission ends the measurement)
     while collected < total_f:
         _drain()
         if collected < total_f:
             time.sleep(0.005)
+    pacer.close(flush=True)
 
     total = time.perf_counter() - total_t0
     pool.stop()

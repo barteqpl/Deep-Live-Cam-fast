@@ -610,10 +610,9 @@ def get_face_swapper() -> Any:
                 # ms/inference, PSNR 58.5 dB vs GPU on the face region), while
                 # simswap (21 vs 81 ms) and hififace (46 vs 116 ms) are faster
                 # on GPU. ANE routing also frees the GPU for face detection.
-                compute_units = (
-                    "CPUAndNeuralEngine" if model_name.startswith("hyperswap")
-                    else "CPUAndGPU"
-                )
+                # Re-measured on macOS 26 with the CoreML-optimized hyperswap
+                # graph: GPU 31 ms vs ANE 58 ms raw, so every model runs on GPU.
+                compute_units = "CPUAndGPU"
                 providers_config = []
                 for p in modules.globals.execution_providers:
                     if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:

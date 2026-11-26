@@ -1175,6 +1175,11 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
             except queue.Full:
                 pass
 
+    # Pool results are emitted on a steady cadence by their own thread
+    # (modules/pacing.py), so detect frames do not show up as stutter.
+    from modules.pacing import PacedEmitter
+    pacer = PacedEmitter(_push_processed)
+
     while not stop_event.is_set():
         # --- 1. DRAIN — collect finished pool jobs (MAIN-thread finalization) ---
         if pool is not None:
@@ -1195,7 +1200,7 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                 if fs_mod is not None:
                     bboxes = [res.bbox] if res.bbox is not None else []
                     out_frame = fs_mod.apply_post_processing(out_frame, bboxes)
-                _push_processed(out_frame)
+                pacer.push(out_frame)
 
         # --- 2. CAPTURE ---
         try:
@@ -1300,6 +1305,8 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
 
         # Legacy path does its own push above; pool path pushes in the drain.
         # After either path, loop back.
+
+    pacer.close(flush=False)
 
 
 def create_webcam_preview(camera_index: int):
