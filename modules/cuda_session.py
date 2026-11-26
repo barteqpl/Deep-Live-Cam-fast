@@ -22,10 +22,6 @@ _ALGOS = ("HEURISTIC", "DEFAULT")
 CUDA = "CUDAExecutionProvider"
 
 
-def _wants_cuda(providers: List[Any]) -> bool:
-    return any((p[0] if isinstance(p, tuple) else p) == CUDA for p in providers)
-
-
 def _with_algo(providers: List[Any], algo: str) -> List[Any]:
     out = []
     for p in providers:
@@ -34,10 +30,8 @@ def _with_algo(providers: List[Any], algo: str) -> List[Any]:
     return out
 
 
-def _runs_on_cuda(session: Any) -> bool:
-    """One zero-filled inference with onnxruntime's CPU fallback disabled."""
-    if session.get_providers()[0] != CUDA:
-        return False
+def _conv_ok(session: Any) -> bool:
+    """False only when a zero-filled run fails inside an execution provider."""
     feed = {}
     for i in session.get_inputs():
         shape = [d if isinstance(d, int) and d > 0 else (1 if k == 0 else 640)
@@ -49,36 +43,34 @@ def _runs_on_cuda(session: Any) -> bool:
     except EPFail:
         return False
     except Exception:
-        return True  # not a CUDA failure (e.g. unusual input shapes): leave it alone
+        pass  # not an EP failure (unusual inputs): leave the session alone
     finally:
         session.enable_fallback()
     return True
 
 
-def _rebuild(path: str, providers: List[Any], **kwargs: Any) -> Any:
+def _fix(session: Any, path: str, providers: List[Any], **kwargs: Any) -> Any:
+    if CUDA not in session.get_providers() or _conv_ok(session):
+        return session
     for algo in _ALGOS:
-        session = ort.InferenceSession(path, providers=_with_algo(providers, algo), **kwargs)
-        if _runs_on_cuda(session):
+        try:
+            retry = ort.InferenceSession(path, providers=_with_algo(providers, algo), **kwargs)
+        except Exception:
+            continue
+        if _conv_ok(retry):
             print(f"[DLC.CUDA] {os.path.basename(path)}: cuDNN found no engine with the "
                   f"exhaustive conv search, using {algo}.")
-            return session
-    return None
+            return retry
+        del retry
+    return session  # onnxruntime's own CPU fallback, as before
 
 
 def cuda_safe_session(path: str, providers: List[Any], **kwargs: Any) -> Any:
     """ort.InferenceSession that stays on CUDA if any conv-algorithm search works."""
-    session = ort.InferenceSession(path, providers=providers, **kwargs)
-    if not _wants_cuda(providers) or _runs_on_cuda(session):
-        return session
-    return _rebuild(path, providers, **kwargs) or session
+    return _fix(ort.InferenceSession(path, providers=providers, **kwargs), path, providers, **kwargs)
 
 
 def ensure_cuda(model: Any, providers: List[Any]) -> None:
-    """Same check for an insightface model object (``.session``, ``.model_file``)."""
-    path = getattr(model, "model_file", None)
-    session = getattr(model, "session", None)
-    if path is None or session is None or not _wants_cuda(providers) or _runs_on_cuda(session):
-        return
-    rebuilt = _rebuild(path, providers)
-    if rebuilt is not None:
-        model.session = rebuilt
+    """Same for an insightface model object (``.session``, ``.model_file``)."""
+    if getattr(model, "model_file", None) and getattr(model, "session", None) is not None:
+        model.session = _fix(model.session, model.model_file, providers)

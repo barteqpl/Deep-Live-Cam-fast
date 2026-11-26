@@ -263,19 +263,9 @@ def prepare_cuda() -> None:
             pass
         if cuda_starts():
             return
-    gpu = ''
-    try:
-        import subprocess
-        gpu = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version,compute_cap', '--format=csv,noheader'],
-                             capture_output=True, text=True, timeout=10).stdout.strip().splitlines()[0]
-    except Exception:
-        pass
-    ort_minor = int(onnxruntime.__version__.split('.')[1])
-    hint = ('onnxruntime-gpu >= 1.27 needs CUDA 13 (driver 580+, RTX 20xx/T4 or newer); '
-            'for an older GPU or driver run: pip install -r requirements-cuda12.txt') if ort_minor >= 27 else \
-           'install the CUDA 12 runtime from pip: pip install -r requirements-cuda12.txt'
-    update_status(f'CUDA execution provider failed to load (onnxruntime-gpu {onnxruntime.__version__}'
-                  f'{", GPU " + gpu if gpu else ""}), models will run on the CPU. {hint}')
+    update_status(f'CUDA execution provider failed to load (onnxruntime-gpu {onnxruntime.__version__}), '
+                  'models will run on the CPU. requirements.txt needs CUDA 13 (NVIDIA driver 580+, '
+                  'RTX 20xx/T4 or newer); for an older GPU or driver: pip install -r requirements-cuda12.txt')
 
 
 def update_status(message: str, scope: str = 'DLC.CORE') -> None:

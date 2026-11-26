@@ -1,5 +1,8 @@
 -r requirements-base.txt
 # CUDA 12 build for older NVIDIA GPUs (Maxwell/Pascal/Volta, e.g. GTX 10xx)
 # or drivers below 580. 1.26 is the last onnxruntime-gpu built for CUDA 12.
-onnxruntime==1.27.0; sys_platform == 'darwin'
 onnxruntime-gpu[cuda,cudnn]==1.26.0; sys_platform != 'darwin'
+# torch >= 2.11 on PyPI is built for CUDA 13 and would load its cuDNN 13
+# into the same process; keep torch on CUDA 12 too.
+torch<2.11
+torchvision<0.26

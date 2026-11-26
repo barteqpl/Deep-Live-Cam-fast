@@ -11,13 +11,12 @@ psutil==5.9.8
 tk==0.1.0
 customtkinter==5.2.2
 pillow==11.1.0
-torch; sys_platform != 'darwin'
-torch; sys_platform == 'darwin'
-torchvision; sys_platform != 'darwin'
-torchvision; sys_platform == 'darwin'
+torch
+torchvision
 tensorflow; sys_platform != 'darwin'
 opennsfw2==0.10.2
 protobuf==4.25.8
 pygrabber; sys_platform == 'win32'
 certifi>=2024.7.4
 tqdm>=4.66.3
+onnxruntime==1.27.0; sys_platform == 'darwin'

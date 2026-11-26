@@ -27,8 +27,11 @@ import modules.globals
 # Match the live defaults regardless of switch_states.json
 # DLC_PROVIDERS="CUDAExecutionProvider,CPUExecutionProvider" runs the bench on CUDA
 # (the --pool path is CoreML-only).
-modules.globals.execution_providers = os.environ.get(
-    "DLC_PROVIDERS", "CoreMLExecutionProvider,CPUExecutionProvider").split(",")
+modules.globals.execution_providers = [p.strip() for p in os.environ.get(
+    "DLC_PROVIDERS", "CoreMLExecutionProvider,CPUExecutionProvider").split(",")]
+if "CUDAExecutionProvider" in modules.globals.execution_providers:
+    from modules.core import prepare_cuda  # same CUDA setup as run.py
+    prepare_cuda()
 modules.globals.many_faces = False
 modules.globals.map_faces = False
 modules.globals.mouth_mask = False
