@@ -35,13 +35,17 @@ def get_face_analyser() -> Any:
                 # insightface prints one diagnostic line per model file
                 # ("Applied providers", "find model", "model ignore", ...).
                 with contextlib.redirect_stdout(io.StringIO()):
-                    FACE_ANALYSER = insightface.app.FaceAnalysis(
+                    analyser = insightface.app.FaceAnalysis(
                         name='buffalo_l',
                         providers=providers,
                         allowed_modules=['detection', 'recognition', 'landmark_2d_106']
                     )
-                    FACE_ANALYSER.prepare(ctx_id=0, det_size=DET_SIZE)
-                _optimize_det_model(FACE_ANALYSER, providers)
+                    analyser.prepare(ctx_id=0, det_size=DET_SIZE)
+                _optimize_det_model(analyser, providers)
+                # Publish only when fully built: a thread passing the unlocked
+                # check above must never see an unprepared analyser
+                # (upstream 5b2caad).
+                FACE_ANALYSER = analyser
     return FACE_ANALYSER
 
 
